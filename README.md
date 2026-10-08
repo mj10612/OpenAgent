@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-brightgreen.svg)](https://python.org)
-[![Tests](https://img.shields.io/badge/Tests-176%20Passed-success.svg)](tests/)
+[![Tests](https://img.shields.io/badge/Tests-CI-success.svg)](tests/)
 [![MCP](https://img.shields.io/badge/MCP-1.0%20Compliant-purple.svg)](https://modelcontextprotocol.io)
 [![Code%20Style](https://img.shields.io/badge/Code%20Style-Ruff%20%7C%20Mypy-blueviolet.svg)](pyproject.toml)
 
@@ -341,7 +341,7 @@ transport = "sse"
 url = "https://analytics-mcp.internal.company.com/sse"
 ```
 
-Tools provided by MCP servers are automatically prefixed with the server name (e.g. `sqlite_read_query`, `github_create_pull_request`) and are subject to the same danger policies as native tools.
+Tools provided by MCP servers are automatically prefixed with the server name (e.g. `sqlite__read_query`, `github__create_pull_request`) and are subject to the same danger policies as native tools.
 
 ---
 
@@ -391,11 +391,10 @@ extra_instructions = [
 # Tool danger policies: "allow", "ask", or "deny"
 [danger_policy]
 none = "allow"       # read_file, glob_find, grep_search, think, todo
-read = "allow"
-fetch = "ask"        # web_fetch
+network = "ask"        # web_fetch
 write = "ask"        # write_file, edit_file
-shell = "ask"        # shell execution
-mcp = "ask"          # MCP tool executions
+execute = "ask"        # shell execution
+# MCP tools use the execute policy regardless of server annotations.
 
 # MCP Server Definitions
 [[mcp_servers]]
@@ -477,3 +476,51 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ```
+
+
+## Session and workspace management
+
+The REPL supports `/model [provider/model]`, `/tokens` (alias `/usage`), and
+`/tools`. Token counts are cumulative for the current REPL; context utilization
+uses the local estimator. For multiline input, enter `"""` or `'''` on its own
+line, type or paste the content, and close with the same delimiter. Ordinary
+Enter continues to submit a single line.
+
+Session lists show complete IDs. Resume and delete accept a unique ID prefix;
+ambiguous prefixes and unknown IDs fail with a clear error.
+
+```bash
+openagent sessions delete <id-or-prefix> --yes
+openagent sessions rm <id-or-prefix> --yes
+openagent sessions prune --older-than 30 --yes
+openagent sessions --clear --yes
+```
+
+Destructive session commands ask for confirmation unless `--yes` is supplied.
+Filesystem tools include confirmation-gated `delete_file(path)` and
+`move_file(source, destination)`. Moving refuses an existing destination; deletion
+accepts regular files only. Both paths remain within the workspace.
+
+System instructions automatically include workspace `AGENTS.md`, `CLAUDE.md`,
+`.openagent/rules.md`, and `.openagent/instructions.md` when present. External
+MCP descriptions and tool results are marked as untrusted data. MCP tools use
+names such as `server__tool`, always require the execute permission policy by
+default, and refresh after a disconnected server is reconnected. Failed calls
+are never automatically replayed, because they may have had side effects.
+
+`web_fetch` asks for permission, downloads at most 2 MB, and rejects private or
+loopback destinations, including redirects. Filesystem searches skip common
+repository metadata, dependency directories, large files, and binary files.
+Shell child processes do not inherit provider credential variables, and stdin
+is closed. An approved shell command still has the process account's filesystem
+access; use an OS sandbox for stronger isolation.
+
+Configuration paths resolve relative to the containing TOML file. Saved settings
+preserve Unicode and all MCP options. Configuration is written atomically with
+owner-only permissions on POSIX; on Windows it inherits the destination folder
+ACL. Prefer environment variables for secrets (see [SECURITY.md](SECURITY.md)).
+
+Azure and Bedrock preset identifiers currently fail explicitly: native Azure
+and AWS signing adapters are not implemented. Use an appropriately configured
+OpenAI-compatible gateway instead. Native adapters are Anthropic, Gemini, and
+Ollama.

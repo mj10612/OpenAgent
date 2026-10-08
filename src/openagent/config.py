@@ -11,15 +11,12 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import tempfile
+import tomllib
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
-
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib  # type: ignore[no-redef]
 
 from openagent.tools.mcp.client import MCPServerConfig
 from openagent.tools.registry import DEFAULT_DANGER_POLICIES, PermissionAction
@@ -175,7 +172,9 @@ def _parse_toml_file(path: Path) -> dict[str, Any]:
         return tomllib.load(f)
 
 
-def _apply_dict_to_config(config_dict: dict[str, Any], current: dict[str, Any]) -> None:
+def _apply_dict_to_config(
+    config_dict: dict[str, Any], current: dict[str, Any], *, base_dir: Path | None = None
+) -> None:
     """Merge dictionary parsed from TOML into current configuration dictionary."""
     scalar_keys = [
         "model",
@@ -194,7 +193,10 @@ def _apply_dict_to_config(config_dict: dict[str, Any], current: dict[str, Any]) 
             current[key] = config_dict[key]
 
     if "workspace" in config_dict and config_dict["workspace"] is not None:
-        current["workspace"] = Path(config_dict["workspace"]).resolve()
+        raw = Path(config_dict["workspace"]).expanduser()
+        current["workspace"] = (
+            raw if raw.is_absolute() else (base_dir or Path.cwd()) / raw
+        ).resolve()
 
     if "danger_policy" in config_dict and isinstance(config_dict["danger_policy"], Mapping):
         current_policy = dict(current.get("danger_policy", {}))
@@ -203,6 +205,12 @@ def _apply_dict_to_config(config_dict: dict[str, Any], current: dict[str, Any]) 
 
     if "mcp_servers" in config_dict:
         current["mcp_servers"] = _parse_mcp_servers(config_dict["mcp_servers"])
+        for server in current["mcp_servers"]:
+            if server.cwd is not None:
+                raw = Path(server.cwd).expanduser()
+                server.cwd = (
+                    raw if raw.is_absolute() else (base_dir or Path.cwd()) / raw
+                ).resolve()
 
     if "custom_provider" in config_dict:
         previous = current.get("custom_provider")
@@ -255,14 +263,14 @@ def load_config(
     global_p = find_global_config_path()
     if global_p and global_p.is_file():
         global_dict = _parse_toml_file(global_p)
-        _apply_dict_to_config(global_dict, config_data)
+        _apply_dict_to_config(global_dict, config_data, base_dir=global_p.parent)
         config_data["config_path"] = global_p
 
     # 2. Project local config file
     proj_p = find_project_config_path()
     if proj_p and proj_p.is_file():
         proj_dict = _parse_toml_file(proj_p)
-        _apply_dict_to_config(proj_dict, config_data)
+        _apply_dict_to_config(proj_dict, config_data, base_dir=proj_p.parent)
         config_data["config_path"] = proj_p
 
     # 3. Explicit config file if specified
@@ -270,7 +278,7 @@ def load_config(
         custom_p = Path(config_path).expanduser().resolve()
         if custom_p.is_file():
             custom_dict = _parse_toml_file(custom_p)
-            _apply_dict_to_config(custom_dict, config_data)
+            _apply_dict_to_config(custom_dict, config_data, base_dir=custom_p.parent)
             config_data["config_path"] = custom_p
         else:
             raise FileNotFoundError(f"Configuration file not found: {custom_p}")
@@ -344,13 +352,13 @@ def save_config(config: OpenAgentConfig, target_path: str | Path) -> None:
 
     lines: list[str] = [
         "# OpenAgent configuration file",
-        f"model = {json.dumps(config.model)}",
+        f"model = {_toml_value(config.model)}",
     ]
 
     if config.base_url:
-        lines.append(f"base_url = {json.dumps(config.base_url)}")
+        lines.append(f"base_url = {_toml_value(config.base_url)}")
     if config.api_key:
-        lines.append(f"api_key = {json.dumps(config.api_key)}")
+        lines.append(f"api_key = {_toml_value(config.api_key)}")
     if config.temperature is not None:
         lines.append(f"temperature = {config.temperature}")
     if config.top_p is not None:
@@ -361,43 +369,55 @@ def save_config(config: OpenAgentConfig, target_path: str | Path) -> None:
         lines.append(f"context_window = {config.context_window}")
     lines.append(f"max_tool_iterations = {config.max_tool_iterations}")
     lines.append(f"auto_approve = {'true' if config.auto_approve else 'false'}")
-    lines.append(f"workspace = {json.dumps(config.workspace.as_posix())}")
+    lines.append(f"workspace = {_toml_value(config.workspace.as_posix())}")
 
     if config.extra_instructions:
-        escaped_instr = [json.dumps(x) for x in config.extra_instructions]
+        escaped_instr = [_toml_value(x) for x in config.extra_instructions]
         lines.append(f"extra_instructions = [{', '.join(escaped_instr)}]")
 
     if config.custom_provider is not None:
         lines.append("\n[custom_provider]")
         for key, value in asdict(config.custom_provider).items():
             if value is not None:
-                lines.append(f"{key} = {json.dumps(value)}")
+                lines.append(f"{key} = {_toml_value(value)}")
 
     # Danger policy table
     lines.append("\n[danger_policy]")
     for danger, action in config.danger_policy.items():
         act_val = action.value if isinstance(action, PermissionAction) else str(action)
-        lines.append(f"{danger} = {json.dumps(act_val)}")
+        lines.append(f"{_toml_value(danger)} = {_toml_value(act_val)}")
 
     # MCP servers
     for server in config.mcp_servers:
         lines.append("\n[[mcp_servers]]")
-        lines.append(f"name = {json.dumps(server.name)}")
-        lines.append(f"transport = {json.dumps(server.transport)}")
-        if server.command:
-            lines.append(f"command = {json.dumps(server.command)}")
-        if server.args:
-            args_str = ", ".join(json.dumps(a) for a in server.args)
-            lines.append(f"args = [{args_str}]")
-        if server.url:
-            lines.append(f"url = {json.dumps(server.url)}")
-        if server.cwd:
-            lines.append(f"cwd = {json.dumps(Path(server.cwd).as_posix())}")
-        if server.env:
-            items = ", ".join(
-                f"{json.dumps(k)} = {json.dumps(str(v))}" for k, v in server.env.items()
-            )
-            lines.append(f"env = {{ {items} }}")
+        for key, value in asdict(server).items():
+            if value is not None:
+                lines.append(f"{key} = {_toml_value(value)}")
 
     content = "\n".join(lines) + "\n"
-    path.write_text(content, encoding="utf-8")
+    # A unique owner-only temporary file prevents truncation and POSIX secret exposure.
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _toml_value(value: Any) -> str:
+    """Encode scalar, array and inline-table values without JSON surrogate escapes."""
+    if isinstance(value, Path):
+        value = value.as_posix()
+    if isinstance(value, Mapping):
+        return (
+            "{ "
+            + ", ".join(f"{_toml_value(str(k))} = {_toml_value(v)}" for k, v in value.items())
+            + " }"
+        )
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    return json.dumps(value, ensure_ascii=False, allow_nan=False)

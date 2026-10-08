@@ -107,6 +107,7 @@ class ChatProvider(abc.ABC):
     supports_system_role: bool = True
     #: Default context window, used for budgeting when unknown.
     default_context_window: int = 128_000
+    default_max_tokens: int | None = None
 
     # -- required ---------------------------------------------------------- #
 
@@ -155,7 +156,15 @@ class ChatProvider(abc.ABC):
                     usage = usage + u
                 case DoneEvent() as done:
                     finish = done.finish_reason.value
-                    usage = usage + done.usage
+                    # Terminal usage is authoritative; streamed usage is a fallback.
+                    if any(
+                        (
+                            done.usage.total_tokens,
+                            done.usage.cached_tokens,
+                            done.usage.reasoning_tokens,
+                        )
+                    ):
+                        usage = done.usage
                     message = done.message
                 case ErrorEvent(error=e):
                     raise e if isinstance(e, BaseException) else ProviderError(str(e))

@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .presets import ProviderPreset, all_presets
+from .presets import ProviderPreset, all_presets, find_preset
 from .provider import ChatProvider
 
 
@@ -35,7 +35,9 @@ class ModelReference:
         if "/" in raw:
             hint, model = raw.split("/", 1)
             return cls(provider_hint=hint.strip() or None, model_name=model.strip(), raw=raw)
-        if ":" in raw:
+        if ":" in raw and (
+            find_preset(raw.split(":", 1)[0]) is not None or raw.split(":", 1)[0] == "custom"
+        ):
             hint, model = raw.split(":", 1)
             return cls(provider_hint=hint.strip() or None, model_name=model.strip(), raw=raw)
         return cls(provider_hint=None, model_name=raw, raw=raw)
@@ -49,14 +51,13 @@ class ProviderRouter:
 
     def _find_preset(self, name: str) -> ProviderPreset | None:
         key = name.strip().lower().replace("_", "-")
-        if key in self._presets:
-            return self._presets[key]
-        for preset in self._presets.values():
-            if key in preset.aliases:
+        for table_key, preset in self._presets.items():
+            names = (table_key, preset.name, *preset.aliases)
+            candidates = (key, key.rstrip("s"), f"{key}s")
+            if any(
+                candidate == n.lower().replace("_", "-") for n in names for candidate in candidates
+            ):
                 return preset
-        for candidate in (key.rstrip("s"), f"{key}s"):
-            if candidate in self._presets:
-                return self._presets[candidate]
         return None
 
     def resolve(
@@ -95,50 +96,29 @@ class ProviderRouter:
                     extra_headers=extra_headers,
                     **kwargs,
                 )
-            if ref.provider_hint == "ollama":
-                from ..providers.ollama import OllamaProvider
-
-                return OllamaProvider(
-                    model=ref.model_name,
-                    base_url=base_url or "http://localhost:11434",
-                    api_key=api_key,
-                    extra_headers=extra_headers,
-                    **kwargs,
+            if base_url is None:
+                raise ValueError(
+                    f"Unknown provider prefix {ref.provider_hint!r}; configure an explicit base_url"
                 )
-            if ref.provider_hint == "gemini":
-                from ..providers.gemini import GeminiProvider
-
-                key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-                return GeminiProvider(
-                    model=ref.model_name,
-                    base_url=base_url or "https://generativelanguage.googleapis.com/v1beta",
-                    api_key=key,
-                    extra_headers=extra_headers,
-                    **kwargs,
-                )
-            if ref.provider_hint == "anthropic":
-                from ..providers.anthropic import AnthropicProvider
-
-                key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-                return AnthropicProvider(
-                    model=ref.model_name,
-                    base_url=base_url or "https://api.anthropic.com",
-                    api_key=key,
-                    extra_headers=extra_headers,
-                    **kwargs,
-                )
-            # Unrecognized provider hint -> default to OpenAICompatProvider
             from ..providers.openai_compat import OpenAICompatProvider
 
-            env_name = f"{ref.provider_hint.upper().replace('-', '_')}_API_KEY"
-            env_key = os.environ.get(env_name)
-            key = api_key or env_key or os.environ.get("OPENAI_API_KEY")
             return OpenAICompatProvider(
-                base_url=base_url or "https://api.openai.com/v1",
+                base_url=base_url,
                 model=ref.model_name,
-                api_key=key,
+                api_key=api_key,
                 provider_name=ref.provider_hint,
                 headers=extra_headers,
+                **kwargs,
+            )
+
+        if ":" in ref.model_name:
+            from ..providers.ollama import OllamaProvider
+
+            return OllamaProvider(
+                model=ref.model_name,
+                base_url=base_url or "http://localhost:11434",
+                api_key=api_key,
+                extra_headers=extra_headers,
                 **kwargs,
             )
 
@@ -168,72 +148,24 @@ class ProviderRouter:
                     **kwargs,
                 )
 
-        # 5. Model prefix heuristics
-        if model_lower.startswith("claude"):
-            from ..providers.anthropic import AnthropicProvider
-
-            ant_preset = self._find_preset("anthropic")
-            base = base_url or (ant_preset.base_url if ant_preset else "https://api.anthropic.com")
-            key = api_key or (ant_preset.auth.resolve_key() if ant_preset else os.environ.get("ANTHROPIC_API_KEY"))
-            return AnthropicProvider(
+        # Route inferred model families through the same preset configuration path.
+        family = None
+        for prefixes, name in (
+            (("claude",), "anthropic"),
+            (("gemini",), "gemini"),
+            (("gpt-", "o1", "o3", "o4", "chatgpt"), "openai"),
+            (("deepseek",), "deepseek"),
+        ):
+            if model_lower.startswith(prefixes):
+                family = self._find_preset(name)
+                break
+        if family is not None:
+            return self._instantiate_preset(
+                family,
                 model=ref.model_name,
-                base_url=base,
-                api_key=key,
+                api_key=api_key,
+                base_url=base_url,
                 extra_headers=extra_headers,
-                **kwargs,
-            )
-
-        if model_lower.startswith("gemini"):
-            from ..providers.gemini import GeminiProvider
-
-            gem_preset = self._find_preset("gemini")
-            base = base_url or (
-                gem_preset.base_url if gem_preset else "https://generativelanguage.googleapis.com/v1beta"
-            )
-            key = api_key or (
-                gem_preset.auth.resolve_key()
-                if gem_preset
-                else (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
-            )
-            return GeminiProvider(
-                model=ref.model_name,
-                base_url=base,
-                api_key=key,
-                extra_headers=extra_headers,
-                **kwargs,
-            )
-
-        if model_lower.startswith(("gpt-", "o1", "o3", "o4", "chatgpt")):
-            from ..providers.openai_compat import OpenAICompatProvider
-
-            openai_preset = self._find_preset("openai")
-            base = base_url or (openai_preset.base_url if openai_preset else "https://api.openai.com/v1")
-            key = api_key or (
-                openai_preset.auth.resolve_key() if openai_preset else os.environ.get("OPENAI_API_KEY")
-            )
-            return OpenAICompatProvider(
-                base_url=base,
-                model=ref.model_name,
-                api_key=key,
-                provider_name="openai",
-                headers=extra_headers,
-                **kwargs,
-            )
-
-        if model_lower.startswith("deepseek"):
-            from ..providers.openai_compat import OpenAICompatProvider
-
-            ds_preset = self._find_preset("deepseek")
-            base = base_url or (ds_preset.base_url if ds_preset else "https://api.deepseek.com/v1")
-            key = api_key or (
-                ds_preset.auth.resolve_key() if ds_preset else os.environ.get("DEEPSEEK_API_KEY")
-            )
-            return OpenAICompatProvider(
-                base_url=base,
-                model=ref.model_name,
-                api_key=key,
-                provider_name="deepseek",
-                headers=extra_headers,
                 **kwargs,
             )
 
@@ -259,14 +191,20 @@ class ProviderRouter:
         extra_headers: dict[str, str] | Mapping[str, str] | None,
         **kwargs: Any,
     ) -> ChatProvider:
-        key = preset.auth.resolve_key(api_key)
+        if preset.kind in ("azure", "bedrock"):
+            raise ValueError(
+                f"Provider {preset.name!r} is not implemented; use a configured OpenAI-compatible endpoint"
+            )
+        key = preset.auth.resolve_key(api_key) if preset.auth.scheme != "none" else None
+        kwargs.setdefault("extra_body", preset.body_defaults)
         effective_base_url = base_url or preset.base_url
         merged_headers = {**preset.headers, **dict(extra_headers or {})}
+        provider: ChatProvider
 
         if preset.kind == "anthropic" or preset.name == "anthropic":
             from ..providers.anthropic import AnthropicProvider
 
-            return AnthropicProvider(
+            provider = AnthropicProvider(
                 model=model,
                 base_url=effective_base_url,
                 api_key=key,
@@ -274,11 +212,14 @@ class ProviderRouter:
                 context_window=preset.context_window,
                 **kwargs,
             )
+            provider.default_max_tokens = preset.max_output
+            provider.tool_protocol = preset.protocol
+            return provider
 
         if preset.kind == "gemini" or preset.name == "gemini":
             from ..providers.gemini import GeminiProvider
 
-            return GeminiProvider(
+            provider = GeminiProvider(
                 model=model,
                 base_url=effective_base_url,
                 api_key=key,
@@ -286,11 +227,14 @@ class ProviderRouter:
                 context_window=preset.context_window,
                 **kwargs,
             )
+            provider.default_max_tokens = preset.max_output
+            provider.tool_protocol = preset.protocol
+            return provider
 
         if preset.kind == "ollama" or preset.name == "ollama":
             from ..providers.ollama import OllamaProvider
 
-            return OllamaProvider(
+            provider = OllamaProvider(
                 model=model,
                 base_url=effective_base_url,
                 api_key=key,
@@ -298,16 +242,25 @@ class ProviderRouter:
                 context_window=preset.context_window,
                 **kwargs,
             )
+            provider.default_max_tokens = preset.max_output
+            provider.tool_protocol = preset.protocol
+            return provider
 
         # Default to OpenAICompatProvider
         from ..providers.openai_compat import OpenAICompatProvider
 
-        return OpenAICompatProvider(
+        provider = OpenAICompatProvider(
             base_url=effective_base_url,
             model=model,
             api_key=key,
             provider_name=preset.name,
             headers=merged_headers,
+            auth_header=preset.auth.header
+            or ("authorization" if preset.auth.scheme == "bearer" else preset.auth.scheme),
             context_window=preset.context_window,
             **kwargs,
         )
+
+        provider.default_max_tokens = preset.max_output
+        provider.tool_protocol = preset.protocol
+        return provider

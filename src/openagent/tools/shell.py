@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import locale
+import math
 import os
 import shutil
 import signal
@@ -19,6 +21,19 @@ from openagent.core.types import ToolParam
 from openagent.tools.base import DangerLevel, Tool, ToolResult
 
 MAX_OUTPUT_BYTES = 100 * 1024  # 100 KB cap
+MAX_TIMEOUT = 600.0
+SAFE_ENV_KEYS = {"PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMDATA", "HOMEDRIVE", "HOMEPATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM"}
+
+
+def _decode_output(data: bytes) -> str:
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        encoding = locale.getpreferredencoding(False)
+        if sys.platform == "win32":
+            import ctypes
+            encoding = f"cp{ctypes.windll.kernel32.GetOEMCP()}"
+        return data.decode(encoding, errors="replace")
 
 
 async def _collect_output(proc: asyncio.subprocess.Process) -> tuple[bytes, bytes, bool]:
@@ -85,7 +100,7 @@ class ShellTool(Tool):
         shell_type: Literal["auto", "powershell", "cmd", "bash", "sh"] = "auto",
     ) -> None:
         super().__init__()
-        self.workspace_root = Path(workspace_root).resolve() if workspace_root else None
+        self.workspace_root = Path(workspace_root or Path.cwd()).resolve()
         self.shell_type = shell_type
         self.params = [
             ToolParam(name="command", type="string", description="Shell command line to execute"),
@@ -109,6 +124,9 @@ class ShellTool(Tool):
         command = str(kwargs.get("command", ""))
         timeout = float(kwargs.get("timeout", 120.0))
         cwd = kwargs.get("cwd")
+
+        if not math.isfinite(timeout) or not 0 < timeout <= MAX_TIMEOUT:
+            return ToolResult(call_id, f"Timeout must be finite and between 0 and {MAX_TIMEOUT} seconds.", True)
 
         if not command:
             return ToolResult(
@@ -139,6 +157,8 @@ class ShellTool(Tool):
         process_options: dict[str, Any] = (
             {"start_new_session": True} if sys.platform != "win32" else {}
         )
+        process_options["stdin"] = asyncio.subprocess.DEVNULL
+        process_options["env"] = {key: value for key, value in os.environ.items() if key.upper() in SAFE_ENV_KEYS}
         try:
             if self.shell_type == "powershell":
                 proc = await asyncio.create_subprocess_exec(
@@ -148,7 +168,7 @@ class ShellTool(Tool):
                     "-ExecutionPolicy",
                     "Bypass",
                     "-Command",
-                    command,
+                    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8; " + command,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     cwd=str(work_dir) if work_dir else None,
@@ -212,8 +232,8 @@ class ShellTool(Tool):
                 await asyncio.wait_for(collection, timeout=5)
             raise
 
-        stdout_text = stdout_bytes.decode(sys.getdefaultencoding(), errors="replace")
-        stderr_text = stderr_bytes.decode(sys.getdefaultencoding(), errors="replace")
+        stdout_text = _decode_output(stdout_bytes)
+        stderr_text = _decode_output(stderr_bytes)
 
         returncode = proc.returncode if proc.returncode is not None else -1
         is_error = returncode != 0
@@ -247,7 +267,9 @@ async def execute_shell(
     timeout: float = 120.0,
     cwd: str | Path | None = None,
     call_id: str = "",
+    *,
+    workspace_root: str | Path | None = None,
 ) -> ToolResult:
     """Helper function to execute shell command asynchronously."""
-    tool = ShellTool(workspace_root=cwd)
+    tool = ShellTool(workspace_root=workspace_root or Path.cwd())
     return await tool.execute(command=command, timeout=timeout, cwd=cwd, call_id=call_id)

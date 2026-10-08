@@ -13,12 +13,15 @@ import json
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
+import httpx
+
 from ..core.events import (
     DoneEvent,
     ErrorEvent,
     StartEvent,
     StreamEvent,
     TextDelta,
+    ThinkingDelta,
     ToolCallDelta,
     ToolCallEnd,
     ToolCallStart,
@@ -64,8 +67,10 @@ class OllamaProvider(ChatProvider):
         max_retries: int = 3,
         extra_headers: Mapping[str, str] | None = None,
         context_window: int | None = None,
+        extra_body: Mapping[str, Any] | None = None,
         client: Any = None,
     ) -> None:
+        self.extra_body = dict(extra_body or {})
         self.model = model
         self.base_url = base_url.rstrip("/")
         if self.base_url.endswith("/v1"):
@@ -144,8 +149,10 @@ class OllamaProvider(ChatProvider):
             options["top_p"] = request.top_p
         if request.stop:
             options["stop"] = list(request.stop)
-        if request.max_tokens is not None:
-            options["num_predict"] = request.max_tokens
+        if request.max_tokens is not None or self.default_max_tokens is not None:
+            options["num_predict"] = (
+                request.max_tokens if request.max_tokens is not None else self.default_max_tokens
+            )
 
         if options:
             payload["options"] = options
@@ -153,6 +160,7 @@ class OllamaProvider(ChatProvider):
         if request.tools:
             payload["tools"] = [spec.to_openai_schema() for spec in request.tools]
 
+        payload.update(self.extra_body)
         return payload
 
     # -- streaming ---------------------------------------------------------- #
@@ -171,6 +179,8 @@ class OllamaProvider(ChatProvider):
             yield StartEvent(model=request.model, provider=self.name)
 
             text_parts: list[str] = []
+            reasoning_parts: list[str] = []
+            thinking_parser = _ThinkingParser()
             calls: list[ToolCall] = []
             usage = Usage()
             finish_reason = FinishReason.STOP
@@ -193,10 +203,19 @@ class OllamaProvider(ChatProvider):
                     return
 
                 msg_obj = chunk.get("message") or {}
+                if thinking := msg_obj.get("thinking"):
+                    reasoning_parts.append(thinking)
+                    yield ThinkingDelta(text=thinking)
                 content = msg_obj.get("content")
-                if content:
-                    text_parts.append(content)
-                    yield TextDelta(text=content, index=len(text_parts) - 1)
+                for thinking, text in thinking_parser.feed(
+                    content or "", final=bool(chunk.get("done"))
+                ):
+                    if thinking:
+                        reasoning_parts.append(text)
+                        yield ThinkingDelta(text=text)
+                    else:
+                        text_parts.append(text)
+                        yield TextDelta(text=text)
 
                 tool_calls = msg_obj.get("tool_calls")
                 if tool_calls and isinstance(tool_calls, list):
@@ -206,7 +225,9 @@ class OllamaProvider(ChatProvider):
                         raw_args = fn.get("arguments") or {}
                         call_id = tc.get("id") or f"call_{len(calls)}"
                         raw_args_str = (
-                            json.dumps(raw_args) if isinstance(raw_args, (dict, list)) else str(raw_args)
+                            json.dumps(raw_args)
+                            if isinstance(raw_args, (dict, list))
+                            else str(raw_args)
                         )
                         parsed_args = coerce_arguments(raw_args)
 
@@ -238,19 +259,39 @@ class OllamaProvider(ChatProvider):
 
                     yield DoneEvent(
                         finish_reason=finish_reason,
-                        message=Message.assistant("".join(text_parts), tool_calls=calls),
+                        message=Message.assistant(
+                            "".join(text_parts),
+                            tool_calls=calls,
+                            reasoning="".join(reasoning_parts) or None,
+                        ),
                         usage=usage,
                     )
                     break
 
             if not done_received:
+                for thinking, text in thinking_parser.feed("", final=True):
+                    if thinking:
+                        reasoning_parts.append(text)
+                        yield ThinkingDelta(text=text)
+                    else:
+                        text_parts.append(text)
+                        yield TextDelta(text=text)
                 if calls:
                     finish_reason = FinishReason.TOOL_CALLS
                 yield DoneEvent(
                     finish_reason=finish_reason,
-                    message=Message.assistant("".join(text_parts), tool_calls=calls),
+                    message=Message.assistant(
+                        "".join(text_parts),
+                        tool_calls=calls,
+                        reasoning="".join(reasoning_parts) or None,
+                    ),
                     usage=usage,
                 )
+        except httpx.HTTPError as exc:
+            error = ProviderError(f"network error: {exc}", retryable=True, provider=self.name)
+            yield ErrorEvent(error=error, retryable=True)
+        except ProviderError as exc:
+            yield ErrorEvent(error=exc, retryable=exc.retryable)
         finally:
             await response.aclose()
 
@@ -271,3 +312,35 @@ class OllamaProvider(ChatProvider):
 
     async def close(self) -> None:
         await self._transport.aclose()
+
+
+class _ThinkingParser:
+    """Split legacy inline thinking, retaining tags fragmented across NDJSON chunks."""
+
+    def __init__(self) -> None:
+        self.buffer = ""
+        self.thinking = False
+
+    def feed(self, text: str, *, final: bool = False) -> list[tuple[bool, str]]:
+        self.buffer += text
+        output: list[tuple[bool, str]] = []
+        while self.buffer:
+            tag = "</think>" if self.thinking else "<think>"
+            index = self.buffer.find(tag)
+            if index >= 0:
+                if index:
+                    output.append((self.thinking, self.buffer[:index]))
+                self.buffer = self.buffer[index + len(tag) :]
+                self.thinking = not self.thinking
+                continue
+            retained = 0
+            if not final:
+                for size in range(1, min(len(tag), len(self.buffer) + 1)):
+                    if self.buffer.endswith(tag[:size]):
+                        retained = size
+            cut = len(self.buffer) - retained
+            if cut:
+                output.append((self.thinking, self.buffer[:cut]))
+                self.buffer = self.buffer[cut:]
+            break
+        return output

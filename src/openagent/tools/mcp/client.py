@@ -6,13 +6,18 @@ Licensed under the Apache License, Version 2.0.
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
-from collections.abc import Mapping
+import time
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+import anyio
+import httpx
 import mcp.types as types
 from mcp.client.session import ClientSession
 from mcp.client.sse import sse_client
@@ -20,6 +25,14 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from openagent.core.types import ToolParam
 from openagent.tools.base import DangerLevel, Tool, ToolResult
+
+
+def _transport_failed(exc: BaseException) -> bool:
+    if isinstance(exc, (ConnectionError, OSError, EOFError, anyio.EndOfStream, anyio.BrokenResourceError, anyio.ClosedResourceError, httpx.TransportError)):
+        return True
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_transport_failed(child) for child in exc.exceptions)
+    return type(exc).__name__ in ("McpError", "MCPError") and "connection closed" in str(exc).lower()
 
 
 @dataclass(slots=True)
@@ -99,6 +112,29 @@ class MCPClient:
         self._exit_stack: AsyncExitStack | None = None
         self._is_connected: bool = False
         self._init_result: types.InitializeResult | None = None
+        self._reconnect_needed = False
+        self._retry_after = 0.0
+        self._reconnect_lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
+        self._transport_task: asyncio.Task[None] | None = None
+        self._close_event: asyncio.Event | None = None
+
+    async def _recover_connection(self) -> None:
+        async with self._reconnect_lock:
+            if self.is_connected or not self._reconnect_needed:
+                return
+            if time.monotonic() < self._retry_after:
+                raise RuntimeError("MCP reconnect temporarily backed off")
+            try:
+                await self.close()
+                await self.connect()
+                # A fresh transport may expose a different tool set.
+                await self._list_tools_once()
+                self._reconnect_needed = False
+            except Exception:
+                self._retry_after = time.monotonic() + 1.0
+                self._reconnect_needed = True
+                raise
 
     @property
     def is_connected(self) -> bool:
@@ -112,14 +148,32 @@ class MCPClient:
 
     async def connect(self) -> None:
         """Establish connection and complete the MCP protocol handshake."""
+        async with self._lifecycle_lock:
+            await self._connect()
+
+    async def _connect(self) -> None:
         if self.is_connected:
             return
+
+        if self._transport_task is not None:
+            await self._close_transport()
 
         if self._session is not None:
             self._init_result = await self._session.initialize()
             self._is_connected = True
             return
 
+        ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._close_event = asyncio.Event()
+        self._transport_task = asyncio.create_task(self._run_transport(ready, self._close_event))
+        try:
+            await asyncio.shield(ready)
+        except BaseException:
+            await self._close_transport()
+            raise
+
+    async def _run_transport(self, ready: asyncio.Future[None], stop: asyncio.Event) -> None:
+        """Enter and exit every AnyIO cancel scope in one dedicated owner task."""
         stack = AsyncExitStack()
         try:
             if self.config.transport == "stdio":
@@ -155,17 +209,48 @@ class MCPClient:
             self._session = session
             self._exit_stack = stack
             self._is_connected = True
-        except Exception:
-            await stack.aclose()
-            self._session = None
-            self._is_connected = False
-            raise
+            ready.set_result(None)
+            await stop.wait()
+        except BaseException as exc:
+            if not ready.done():
+                ready.set_exception(exc)
+            else:
+                self._reconnect_needed = not stop.is_set()
+        finally:
+            try:
+                await stack.aclose()
+            finally:
+                self._exit_stack = None
+                self._session = None
+                self._is_connected = False
+
+    async def _close_transport(self) -> None:
+        task = self._transport_task
+        if task is not None:
+            if self._close_event is not None:
+                self._close_event.set()
+            try:
+                await asyncio.shield(task)
+            finally:
+                self._transport_task = None
+                self._close_event = None
 
     async def list_tools(self) -> list[types.Tool]:
         """Discover tools exposed by the MCP server, exhausting pagination."""
+        await self._recover_connection()
         if not self.is_connected or self._session is None:
             raise RuntimeError(f"MCPClient '{self.config.name}' is not connected.")
 
+        try:
+            return await self._list_tools_once()
+        except Exception as exc:
+            if _transport_failed(exc):
+                self._is_connected = False
+                self._reconnect_needed = True
+            raise
+
+    async def _list_tools_once(self) -> list[types.Tool]:
+        assert self._session is not None
         result = await self._session.list_tools()
         tools = list(result.tools)
         cursor = result.next_cursor
@@ -183,21 +268,25 @@ class MCPClient:
         arguments: dict[str, Any] | None = None,
     ) -> types.CallToolResult | Any:
         """Call a tool on the MCP server."""
+        await self._recover_connection()
         if not self.is_connected or self._session is None:
             raise RuntimeError(f"MCPClient '{self.config.name}' is not connected.")
 
-        return await self._session.call_tool(name, arguments=arguments or {})
+        try:
+            return await self._session.call_tool(name, arguments=arguments or {})
+        except Exception as exc:
+            # Never replay: a mutating remote call may have completed before
+            # the transport failed. The next operation performs recovery.
+            if _transport_failed(exc):
+                self._is_connected = False
+                self._reconnect_needed = True
+            raise
 
     async def close(self) -> None:
         """Cleanly disconnect and release transport resources."""
-        if self._exit_stack is not None:
-            try:
-                await self._exit_stack.aclose()
-            finally:
-                self._exit_stack = None
-                self._session = None
-                self._is_connected = False
-        else:
+        async with self._lifecycle_lock:
+            await self._close_transport()
+            self._reconnect_needed = False
             self._session = None
             self._is_connected = False
 
@@ -233,20 +322,8 @@ class MCPTool(Tool):
             or ""
         )
 
-        if danger is not None:
-            self.danger = danger
-        else:
-            annotations = getattr(tool_def, "annotations", None)
-            if annotations is None and isinstance(tool_def, Mapping):
-                annotations = tool_def.get("annotations")
-
-            read_only = False
-            if annotations is not None:
-                read_only = bool(
-                    getattr(annotations, "read_only_hint", False)
-                    or (isinstance(annotations, Mapping) and annotations.get("read_only_hint", False))
-                )
-            self.danger = "none" if read_only else "execute"
+        # Remote hints are descriptions, never local authorization.
+        self.danger = danger if danger is not None else "execute"
 
         schema = getattr(tool_def, "input_schema", None)
         if schema is None:
@@ -255,6 +332,8 @@ class MCPTool(Tool):
             schema = tool_def.get("input_schema") or tool_def.get("inputSchema")
 
         self.params: list[ToolParam] = self._parse_input_schema(schema)
+        self.input_schema = copy.deepcopy(dict(schema)) if isinstance(schema, Mapping) else {"type": "object"}
+        self.prepare_callback: Callable[[str], Awaitable[MCPTool | None]] | None = None
 
     @classmethod
     def _parse_input_schema(cls, schema: Any) -> list[ToolParam]:
@@ -311,6 +390,14 @@ class MCPTool(Tool):
         }
 
         try:
+            if self.prepare_callback is not None:
+                refreshed = await self.prepare_callback(self.name)
+                if refreshed is None:
+                    raise RuntimeError("Tool is no longer available after MCP reconnect")
+                if refreshed is not self:
+                    from jsonschema import Draft202012Validator
+                    Draft202012Validator(refreshed.spec.schema()).validate(arguments)
+                    return await refreshed.execute(call_id=call_id, **arguments)
             res = await self.client.call_tool(self.raw_name, arguments=arguments)
         except Exception as exc:
             return ToolResult(

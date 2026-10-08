@@ -154,6 +154,23 @@ class MessageManager:
 
     # -- Sliding Window ---------------------------------------------------- #
 
+    @staticmethod
+    def valid_tool_group(group: Sequence[Message]) -> bool:
+        """Require exactly one result for each uniquely identified tool call."""
+        first = group[0]
+        if first.role == "tool":
+            return False
+        if first.role != "assistant" or not first.tool_calls:
+            return True
+        expected = [call.id for call in first.tool_calls]
+        actual = [message.tool_call_id for message in group[1:]]
+        return (
+            all(expected)
+            and len(set(expected)) == len(expected)
+            and len(actual) == len(expected)
+            and set(actual) == set(expected)
+        )
+
     def window(
         self,
         max_tokens: int,
@@ -177,6 +194,8 @@ class MessageManager:
 
         system_tokens = est.estimate_message(system_msg) if system_msg else 0
         if system_tokens >= max_tokens:
+            if conv_messages:
+                raise ValueError("Context budget cannot fit the active turn and system prompt.")
             return [system_msg] if system_msg else []
 
         remaining_budget = max_tokens - system_tokens
@@ -187,6 +206,9 @@ class MessageManager:
 
         for group in reversed(groups):
             first_msg = group[0]
+
+            if not self.valid_tool_group(group):
+                continue
 
             # Enforce Atomic Tool Pair Invariant:
             # 1. An orphaned tool message without an assistant must never be included.
@@ -210,6 +232,11 @@ class MessageManager:
                 selected_groups.append(group)
                 remaining_budget -= group_tokens
             else:
+                if not selected_groups:
+                    raise ValueError(
+                        f"The newest turn needs approximately {group_tokens} tokens, "
+                        f"but only {remaining_budget} are available."
+                    )
                 # Cannot fit this entire atomic group; stop adding older turns.
                 break
 

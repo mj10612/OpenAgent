@@ -19,6 +19,7 @@ Licensed under the Apache License, Version 2.0.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any
 
@@ -170,7 +171,7 @@ class OpenAICompatProvider(ChatProvider):
         url = base_url.rstrip("/")
         if url.endswith("/chat/completions"):
             url = url[: -len("/chat/completions")]
-        if not url.endswith("/v1") and "api.openai.com" not in url:
+        if not re.search(r"/v\d+[a-z]*(?:/|$)", url):
             # Most OpenAI-compatible servers expose their API under /v1.
             url = f"{url}/v1"
         return url
@@ -235,9 +236,7 @@ class OpenAICompatProvider(ChatProvider):
 
     def build_payload(self, request: ChatRequest, *, stream: bool) -> dict[str, Any]:
         """Assemble the JSON body for a completion request."""
-        use_text_protocol = (
-            bool(request.tools) and self.tool_protocol == ToolProtocol.TEXT
-        )
+        use_text_protocol = bool(request.tools) and self.tool_protocol == ToolProtocol.TEXT
 
         if use_text_protocol:
             system = self._codec.render(request)
@@ -267,11 +266,14 @@ class OpenAICompatProvider(ChatProvider):
         if request.seed is not None and not reasoning:
             payload["seed"] = request.seed
 
-        if request.max_tokens:
+        max_tokens = (
+            request.max_tokens if request.max_tokens is not None else self.default_max_tokens
+        )
+        if max_tokens is not None:
             if reasoning:
-                payload["max_completion_tokens"] = request.max_tokens
+                payload["max_completion_tokens"] = max_tokens
             else:
-                payload["max_tokens"] = request.max_tokens
+                payload["max_tokens"] = max_tokens
 
         if request.stop:
             payload["stop"] = request.stop
@@ -300,9 +302,7 @@ class OpenAICompatProvider(ChatProvider):
             return
 
         try:
-            use_text_protocol = (
-                bool(request.tools) and self.tool_protocol == ToolProtocol.TEXT
-            )
+            use_text_protocol = bool(request.tools) and self.tool_protocol == ToolProtocol.TEXT
 
             yield StartEvent(model=request.model, provider=self.name)
 
@@ -314,7 +314,6 @@ class OpenAICompatProvider(ChatProvider):
 
             # Partial tool calls keyed by streaming index.
             partials: dict[int, dict[str, str]] = {}
-            decoder = _IncrementalJSONDecoder()
             codec_stream = self._codec.parse_stream() if use_text_protocol else None
 
             try:
@@ -362,7 +361,9 @@ class OpenAICompatProvider(ChatProvider):
                             if fn := raw_call.get("function"):
                                 if fn_name := fn.get("name"):
                                     if not slot["name"]:
-                                        yield ToolCallStart(index=index, name=fn_name, id=slot["id"])
+                                        yield ToolCallStart(
+                                            index=index, name=fn_name, id=slot["id"]
+                                        )
                                     slot["name"] += fn_name
                                 if args_delta := fn.get("arguments"):
                                     slot["args"] += args_delta
@@ -379,7 +380,7 @@ class OpenAICompatProvider(ChatProvider):
                 final_tool_calls: list[ToolCall] = []
                 for index, slot in sorted(partials.items()):
                     try:
-                        arguments = coerce_arguments(decoder.decode(slot["args"]))
+                        arguments = coerce_arguments(slot["args"])
                     except ProviderError as exc:
                         yield ErrorEvent(error=exc)
                         return
@@ -454,33 +455,6 @@ class OpenAICompatProvider(ChatProvider):
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-
-
-class _IncrementalJSONDecoder:
-    """Remembers the last valid JSON position to survive broken deltas.
-
-    Some gateways emit pretty-printed JSON across SSE chunks; ``raw_decode``
-    lets us recover partial buffers instead of discarding them.
-    """
-
-    def __init__(self) -> None:
-        self._buffer = ""
-
-    def decode(self, text: str) -> str:
-        self._buffer += text
-        try:
-            json.loads(self._buffer)
-            return self._buffer
-        except json.JSONDecodeError:
-            pass
-
-        decoder = json.JSONDecoder()
-        end = 0
-        try:
-            _, end = decoder.raw_decode(self._buffer.lstrip())
-        except json.JSONDecodeError:
-            return self._buffer
-        return self._buffer[:end] or self._buffer
 
 
 async def _iter_openai_sse(response: Any) -> AsyncIterator[SSEvent]:

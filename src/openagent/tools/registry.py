@@ -12,6 +12,8 @@ from collections.abc import Awaitable, Callable
 from enum import StrEnum
 from typing import Any
 
+from jsonschema import Draft202012Validator
+
 from openagent.core.types import ToolCall, ToolSpec
 from openagent.tools.base import Tool, ToolResult
 
@@ -28,7 +30,7 @@ DEFAULT_DANGER_POLICIES: dict[str, PermissionAction] = {
     "none": PermissionAction.ALLOW,
     "write": PermissionAction.ASK,
     "execute": PermissionAction.ASK,
-    "network": PermissionAction.ALLOW,
+    "network": PermissionAction.ASK,
 }
 
 AskCallback = Callable[[ToolCall], Awaitable[bool] | bool]
@@ -47,6 +49,8 @@ class ToolRegistry:
         if danger_policies:
             self._danger_policies.update(danger_policies)
         self._tool_policies: dict[str, PermissionAction] = {}
+        self._mutation_lock = asyncio.Lock()
+        self._confirmation_lock = asyncio.Lock()
 
         if tools:
             for tool in tools:
@@ -54,6 +58,8 @@ class ToolRegistry:
 
     def register(self, tool: Tool) -> None:
         """Register a tool instance."""
+        if tool.name in self._tools and self._tools[tool.name] is not tool:
+            raise ValueError(f"Tool '{tool.name}' is already registered.")
         self._tools[tool.name] = tool
 
     def unregister(self, name: str) -> None:
@@ -103,7 +109,14 @@ class ToolRegistry:
         call: ToolCall,
         ask_callback: AskCallback | None = None,
     ) -> ToolResult:
-        """Execute a single tool call enforcing permissions."""
+        """Execute a call, serializing state changes and terminal confirmations."""
+        tool = self.get(call.name)
+        if tool is not None and getattr(tool, "danger", "none") in ("write", "execute"):
+            async with self._mutation_lock:
+                return await self._execute_call(call, ask_callback)
+        return await self._execute_call(call, ask_callback)
+
+    async def _execute_call(self, call: ToolCall, ask_callback: AskCallback | None) -> ToolResult:
         tool = self.get(call.name)
         if tool is None:
             return ToolResult(
@@ -111,6 +124,15 @@ class ToolRegistry:
                 output=f"Tool not found: '{call.name}'",
                 is_error=True,
             )
+
+        try:
+            schema = tool.spec.schema()
+            Draft202012Validator.check_schema(schema)
+            errors = list(Draft202012Validator(schema).iter_errors(call.arguments))
+            if errors:
+                return ToolResult(call_id=call.id, output=f"Invalid tool arguments: {errors[0].message}", is_error=True)
+        except Exception as exc:
+            return ToolResult(call_id=call.id, output=f"Invalid tool argument schema: {exc}", is_error=True)
 
         policy = self.get_policy(call.name)
         if policy == PermissionAction.DENY:
@@ -128,8 +150,9 @@ class ToolRegistry:
                     is_error=True,
                 )
             try:
-                verdict = ask_callback(call)
-                allowed = await verdict if inspect.isawaitable(verdict) else verdict
+                async with self._confirmation_lock:
+                    verdict = ask_callback(call)
+                    allowed = await verdict if inspect.isawaitable(verdict) else verdict
             except Exception as exc:
                 return ToolResult(
                     call_id=call.id,
@@ -151,6 +174,10 @@ class ToolRegistry:
             ):
                 kwargs["call_id"] = call.id
             res = await tool.execute(**kwargs)
+            if not isinstance(res, ToolResult):
+                raise TypeError(f"Expected ToolResult, got {type(res).__name__}")
+            if not isinstance(res.output, str):
+                raise TypeError("ToolResult.output must be a string")
         except Exception as exc:
             return ToolResult(
                 call_id=call.id,

@@ -6,8 +6,10 @@ Licensed under the Apache License, Version 2.0.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -24,7 +26,7 @@ class MCPManager:
         self,
         registry: ToolRegistry | None = None,
         configs: Sequence[MCPServerConfig] | None = None,
-        prefix_tool_names: bool = False,
+        prefix_tool_names: bool = True,
         client_factory: Callable[[MCPServerConfig], MCPClient] | None = None,
     ) -> None:
         self.registry: ToolRegistry = registry if registry is not None else ToolRegistry()
@@ -36,6 +38,52 @@ class MCPManager:
         self.clients: dict[str, MCPClient] = {}
         self.tools: dict[str, list[MCPTool]] = {}
         self.failed_servers: dict[str, Exception] = {}
+        self._reconnect_locks: dict[str, asyncio.Lock] = {}
+        self._retry_after: dict[str, float] = {}
+
+    def _wrap(self, client: MCPClient, definition: Any, name: str) -> MCPTool:
+        tool = MCPTool(client, definition, server_name=name, name_prefix=self.prefix_tool_names)
+        async def prepare(tool_name: str):
+            await self.ensure_tools(name)
+            return self.registry.get(tool_name)
+        tool.prepare_callback = prepare
+        return tool
+
+    async def ensure_tools(self, name: str) -> list[MCPTool]:
+        """Recover once on the next operation, refreshing the registry atomically."""
+        async with self._reconnect_locks.setdefault(name, asyncio.Lock()):
+            client = self.clients.get(name)
+            if client is not None and client.is_connected:
+                return self.tools.get(name, [])
+            if time.monotonic() < self._retry_after.get(name, 0):
+                raise RuntimeError(f"MCP server '{name}' reconnect is temporarily backed off")
+            if client is None:
+                return await self.start_server(name)
+            try:
+                await client.close()
+                await client.connect()
+                definitions = await client.list_tools()
+                wrapped = [self._wrap(client, definition, name) for definition in definitions]
+                old = self.tools.get(name, [])
+                old_names = {tool.name for tool in old}
+                names = [tool.name for tool in wrapped]
+                if len(set(names)) != len(names) or any(tool.name in self.registry and tool.name not in old_names for tool in wrapped):
+                    raise ValueError("MCP tools collide with already registered tools")
+                for tool in old:
+                    if self.registry.get(tool.name) is tool:
+                        self.registry.unregister(tool.name)
+                for tool in wrapped:
+                    self.registry.register(tool)
+                self.tools[name] = wrapped
+                self.failed_servers.pop(name, None)
+                self._retry_after.pop(name, None)
+                return wrapped
+            except Exception as exc:
+                self.failed_servers[name] = exc
+                self._retry_after[name] = time.monotonic() + 1.0
+                with contextlib.suppress(Exception):
+                    await client.close()
+                raise
 
     def add_server(self, config: MCPServerConfig) -> None:
         """Register or update an MCP server configuration."""
@@ -56,12 +104,7 @@ class MCPManager:
             await client.connect()
             mcp_tool_defs = await client.list_tools()
             for tool_def in mcp_tool_defs:
-                tool = MCPTool(
-                    client=client,
-                    tool_def=tool_def,
-                    server_name=config.name,
-                    name_prefix=self.prefix_tool_names,
-                )
+                tool = self._wrap(client, tool_def, config.name)
                 self.registry.register(tool)
                 wrapped_tools.append(tool)
 
@@ -82,7 +125,8 @@ class MCPManager:
         """Stop an individual MCP server and unregister its tools."""
         registered_tools = self.tools.pop(name, [])
         for tool in registered_tools:
-            self.registry.unregister(tool.name)
+            if self.registry.get(tool.name) is tool:
+                self.registry.unregister(tool.name)
 
         client = self.clients.pop(name, None)
         if client is not None:
@@ -122,7 +166,7 @@ class MCPManager:
         cls,
         data: Mapping[str, Any],
         registry: ToolRegistry | None = None,
-        prefix_tool_names: bool = False,
+        prefix_tool_names: bool = True,
         client_factory: Callable[[MCPServerConfig], MCPClient] | None = None,
     ) -> MCPManager:
         """Instantiate an MCPManager from a dictionary or TOML structure."""

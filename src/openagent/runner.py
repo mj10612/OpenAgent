@@ -9,7 +9,7 @@ Licensed under the Apache License, Version 2.0.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from pathlib import Path
 
 from openagent.context.compactor import Compactor
@@ -78,7 +78,10 @@ class AgentRunner:
         self.session_store = session_store
         self.session_id = session_id
         self.max_tool_iterations = max_tool_iterations
-        self.max_tokens = max_tokens
+        self.explicit_max_tokens = max_tokens
+        self.max_tokens = (
+            max_tokens if max_tokens is not None else getattr(provider, "default_max_tokens", None)
+        )
         self.context_window: int = (
             context_window
             if context_window is not None
@@ -86,35 +89,44 @@ class AgentRunner:
             or getattr(provider, "default_context_window", 128_000)
             or 128_000
         )
-        if self.context_window <= 0 or (max_tokens is not None and max_tokens <= 0):
+        if self.context_window <= 0 or (self.max_tokens is not None and self.max_tokens <= 0):
             raise ValueError("Context window and output token limit must be positive.")
         self.temperature = temperature
         self.top_p = top_p
         self.workspace_root = workspace_root
         self.extra_instructions = extra_instructions
+        self._resuming_session = (
+            messages is None and session_store is not None and session_id is not None
+        )
 
         if messages is not None:
             self.messages = messages
         elif self.session_store is not None and self.session_id is not None:
-            try:
-                _, loaded_msgs = self.session_store.load_session(self.session_id)
-                self.messages = MessageManager(loaded_msgs)
-            except FileNotFoundError:
-                self.messages = MessageManager()
+            self.session_id = self.session_store.resolve_session_id(self.session_id)
+            _, loaded_msgs = self.session_store.load_session(self.session_id)
+            self.messages = MessageManager(loaded_msgs)
         else:
             self.messages = MessageManager()
 
-        self._ensure_system_prompt()
+        self._ensure_system_prompt(refresh=True)
 
-    def _ensure_system_prompt(self) -> None:
+    def _ensure_system_prompt(self, *, refresh: bool = False) -> None:
         """Ensure an initial system prompt is present in messages."""
-        if self.messages.system_message is None and self.prompt_builder is not None:
+        existing = self.messages.system_message
+        if self.prompt_builder is not None and (
+            existing is None
+            or (
+                refresh
+                and (self._resuming_session or existing.metadata.get("openagent_generated_prompt"))
+            )
+        ):
             sys_text = self.prompt_builder.build_system_prompt(
                 workspace_root=self.workspace_root,
                 tools=self.tools,
                 extra_instructions=self.extra_instructions,
             )
-            self.messages.add_system(sys_text)
+            prompt = self.messages.add_system(sys_text)
+            prompt.metadata["openagent_generated_prompt"] = True
 
     def _persist_session(self) -> None:
         """Persist current conversation history to SessionStore if configured."""
@@ -128,6 +140,36 @@ class AgentRunner:
         user_input: str | Message,
         ask_callback: AskCallback | None = None,
     ) -> AsyncIterator[StreamEvent]:
+        """Execute a transaction, restoring history on errors or interrupted consumption."""
+        self._ensure_system_prompt()
+        initial_messages = self.messages.copy().messages
+        initial_session_id = self.session_id
+        completed = False
+        stream = self._run_turn(user_input, ask_callback)
+        try:
+            async for event in stream:
+                if isinstance(event, ErrorEvent):
+                    self.messages.clear()
+                    self.messages.extend(initial_messages)
+                if isinstance(event, DoneEvent):
+                    completed = True
+                yield event
+        except Exception as exc:
+            self.messages.clear()
+            self.messages.extend(initial_messages)
+            yield ErrorEvent(error=exc)
+        finally:
+            await stream.aclose()
+            if not completed:
+                self.messages.clear()
+                self.messages.extend(initial_messages)
+                self.session_id = initial_session_id
+
+    async def _run_turn(
+        self,
+        user_input: str | Message,
+        ask_callback: AskCallback | None = None,
+    ) -> AsyncGenerator[StreamEvent, None]:
         """Execute a conversational turn across streaming model calls and tools."""
         self._ensure_system_prompt()
         initial_messages = self.messages.copy().messages
@@ -169,6 +211,8 @@ class AgentRunner:
 
             # Window messages maintaining Atomic Tool Pair Invariant
             req_messages = self.messages.window(input_budget)
+            if user_msg not in req_messages:
+                raise ValueError("Context budget cannot fit the complete active user turn.")
 
             request = ChatRequest(
                 messages=req_messages,
@@ -261,8 +305,8 @@ class AgentRunner:
                 )
                 final_done.message = assistant_msg
                 final_done.usage = cumulative_usage
-                yield final_done
                 self._persist_session()
+                yield final_done
                 return
 
             # Tool calls present: execute tools concurrently via ToolRegistry
@@ -270,6 +314,16 @@ class AgentRunner:
                 assistant_msg.tool_calls,
                 ask_callback=ask_callback,
             )
+            expected_ids = [call.id for call in assistant_msg.tool_calls]
+            result_ids = [result.call_id for result in tool_results]
+            if (
+                not all(expected_ids)
+                or len(set(expected_ids)) != len(expected_ids)
+                or result_ids != expected_ids
+            ):
+                raise ValueError(
+                    "Tool results do not correspond exactly to the assistant tool calls."
+                )
 
             for call, result in zip(assistant_msg.tool_calls, tool_results, strict=True):
                 yield ToolResultEvent(
@@ -290,8 +344,10 @@ class AgentRunner:
                 ),
                 usage=cumulative_usage,
             )
-            yield terminal_event
+            assert terminal_event.message is not None
+            self.messages.append(terminal_event.message)
             self._persist_session()
+            yield terminal_event
 
     async def run_turn_to_completion(
         self,
@@ -301,11 +357,21 @@ class AgentRunner:
         """Run a turn to completion and return the final text response."""
         text_chunks: list[str] = []
         done_text: str = ""
+        error: BaseException | None = None
         async for event in self.run_turn(user_input, ask_callback=ask_callback):
             if isinstance(event, TextDelta):
                 text_chunks.append(event.text)
             elif isinstance(event, DoneEvent) and event.message and event.message.text:
                 done_text = event.message.text
+            elif isinstance(event, ErrorEvent):
+                error = (
+                    event.error
+                    if isinstance(event.error, BaseException)
+                    else RuntimeError(str(event.error))
+                )
+
+        if error is not None:
+            raise error
 
         if done_text.strip():
             return done_text

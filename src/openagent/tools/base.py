@@ -6,6 +6,7 @@ Licensed under the Apache License, Version 2.0.
 
 from __future__ import annotations
 
+import html
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -29,7 +30,7 @@ class ToolResult:
         return Message.tool_result(
             call_id=self.call_id,
             name=name or "",
-            content=self.output,
+            content=f"<tool_output>\n{html.escape(self.output)}\n</tool_output>",
             is_error=self.is_error,
         )
 
@@ -52,6 +53,7 @@ class Tool(ABC):
             params=list(getattr(self, "params", [])),
             danger=getattr(self, "danger", "none"),
             source=getattr(self, "source", "builtin"),
+            input_schema=getattr(self, "input_schema", None),
         )
 
     @abstractmethod

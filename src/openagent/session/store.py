@@ -12,7 +12,9 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import os
+import re
 import time
 import uuid
 from collections.abc import Mapping, Sequence
@@ -20,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from openagent.context.messages import MessageManager
 from openagent.core.types import Message
 
 logger = logging.getLogger(__name__)
@@ -64,10 +67,10 @@ class SessionStore:
     """Manages persistence of conversation histories in JSONL format with atomic writes."""
 
     def __init__(self, storage_dir: str | Path | None = None) -> None:
-        if storage_dir is None:
+        if storage_dir is None or (isinstance(storage_dir, str) and not storage_dir.strip()):
             self._storage_dir = Path.home() / ".openagent" / "sessions"
         else:
-            self._storage_dir = Path(storage_dir).resolve()
+            self._storage_dir = Path(storage_dir).expanduser().resolve()
         self._storage_dir.mkdir(parents=True, exist_ok=True)
 
     @property
@@ -200,30 +203,43 @@ class SessionStore:
             )
             return meta, []
 
-        first_data = json.loads(lines[0])
+        stat = session_path.stat()
+        meta = SessionMetadata(
+            session_id=session_id,
+            created_at=stat.st_ctime,
+            updated_at=stat.st_mtime,
+            title=f"Session {session_id[:8]}",
+        )
         messages: list[Message] = []
+        for lineno, line in enumerate(lines, start=1):
+            try:
+                raw_obj = json.loads(line)
+                if not isinstance(raw_obj, Mapping):
+                    raise ValueError("session row must be an object")
+                if raw_obj.get("type") == "metadata" or "session_id" in raw_obj:
+                    if lineno != 1:
+                        raise ValueError("unexpected metadata row")
+                    meta = SessionMetadata.from_dict(raw_obj)
+                    meta.session_id = session_id
+                else:
+                    message = self._deserialize_message(raw_obj)
+                    if message.role not in {"system", "user", "assistant", "tool"}:
+                        raise ValueError("invalid message role")
+                    messages.append(message)
+            except (TypeError, ValueError, AttributeError, KeyError) as exc:
+                logger.warning("Session %s: skipped corrupt line %d: %s", session_id, lineno, exc)
 
-        if isinstance(first_data, Mapping) and (
-            first_data.get("type") == "metadata" or "session_id" in first_data
-        ):
-            meta = SessionMetadata.from_dict(first_data)
-            message_lines = lines[1:]
-        else:
-            stat = session_path.stat()
-            meta = SessionMetadata(
-                session_id=session_id,
-                created_at=stat.st_ctime,
-                updated_at=stat.st_mtime,
-                model="",
-                title=f"Session {session_id[:8]}",
-                message_count=0,
-            )
-            message_lines = lines
-
-        for line in message_lines:
-            raw_obj = json.loads(line)
-            if isinstance(raw_obj, Mapping):
-                messages.append(self._deserialize_message(raw_obj))
+        valid_messages = []
+        for group in MessageManager.get_atomic_groups(messages):
+            if MessageManager.valid_tool_group(group):
+                valid_messages.extend(group)
+            else:
+                logger.warning(
+                    "Session %s: dropped incomplete or invalid tool correspondence (%d messages)",
+                    session_id,
+                    len(group),
+                )
+        messages = valid_messages
 
         meta.message_count = len(messages)
         return meta, messages
@@ -237,43 +253,8 @@ class SessionStore:
         sessions: list[SessionMetadata] = []
         for file_path in self._storage_dir.glob("*.jsonl"):
             try:
-                with open(file_path, encoding="utf-8") as f:
-                    first_line = f.readline().strip()
-                if not first_line:
-                    stat = file_path.stat()
-                    sessions.append(
-                        SessionMetadata(
-                            session_id=file_path.stem,
-                            created_at=stat.st_ctime,
-                            updated_at=stat.st_mtime,
-                            model="",
-                            title=file_path.stem,
-                            message_count=0,
-                        )
-                    )
-                    continue
-
-                first_data = json.loads(first_line)
-                if isinstance(first_data, Mapping) and (
-                    first_data.get("type") == "metadata" or "session_id" in first_data
-                ):
-                    sessions.append(SessionMetadata.from_dict(first_data))
-                else:
-                    # Legacy or raw JSONL
-                    stat = file_path.stat()
-                    # Count total non-empty lines for message_count
-                    with open(file_path, encoding="utf-8") as f_full:
-                        count = sum(1 for ln in f_full if ln.strip())
-                    sessions.append(
-                        SessionMetadata(
-                            session_id=file_path.stem,
-                            created_at=stat.st_ctime,
-                            updated_at=stat.st_mtime,
-                            model="",
-                            title=file_path.stem,
-                            message_count=count,
-                        )
-                    )
+                metadata, _ = self.load_session(file_path.stem)
+                sessions.append(metadata)
             except Exception as exc:
                 logger.warning("Failed to read session header from %s: %s", file_path, exc)
                 continue
@@ -304,7 +285,47 @@ class SessionStore:
         return existed
 
     def _get_session_path(self, session_id: str) -> Path:
-        return self._storage_dir / f"{session_id}.jsonl"
+        if (
+            not isinstance(session_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", session_id)
+            or ".." in session_id
+        ):
+            raise ValueError(f"Invalid session id: {session_id!r}")
+        path = (self._storage_dir / f"{session_id}.jsonl").resolve()
+        if not path.is_relative_to(self._storage_dir.resolve()):
+            raise ValueError(f"Session path escapes storage directory: {session_id!r}")
+        return path
+
+    def resolve_session_id(self, session_id: str) -> str:
+        """Resolve an exact ID or unique prefix; never create a missing session."""
+        if self._get_session_path(session_id).is_file():
+            return session_id
+        matches = []
+        for path in self._storage_dir.glob("*.jsonl"):
+            if path.stem.startswith(session_id):
+                self._get_session_path(path.stem)
+                matches.append(path.stem)
+        if not matches:
+            raise FileNotFoundError(f"Session '{session_id}' not found")
+        if len(matches) != 1:
+            raise ValueError(f"Session prefix '{session_id}' is ambiguous")
+        return matches[0]
+
+    def cleanup_sessions(self, *, older_than_days: float | None = None) -> int:
+        """Delete all sessions, or those last updated more than N days ago."""
+        if older_than_days is not None and (
+            not math.isfinite(older_than_days) or older_than_days < 0
+        ):
+            raise ValueError("Session age must be finite and nonnegative")
+        cutoff = time.time() - older_than_days * 86400 if older_than_days is not None else None
+        removed = 0
+        for path in self._storage_dir.glob("*.jsonl"):
+            if cutoff is not None:
+                metadata, _ = self.load_session(path.stem)
+                if metadata.updated_at >= cutoff:
+                    continue
+            removed += self.delete_session(path.stem)
+        return removed
 
     def _atomic_write_session(
         self,
@@ -353,7 +374,11 @@ class SessionStore:
     def _deserialize_message(data: Mapping[str, Any]) -> Message:
         """Deserialize a dict into a Message restoring ToolCall raw_arguments."""
         payload = dict(data)
-        if payload.get("type") == "message" and "data" in payload and isinstance(payload["data"], Mapping):
+        if (
+            payload.get("type") == "message"
+            and "data" in payload
+            and isinstance(payload["data"], Mapping)
+        ):
             payload = dict(payload["data"])
 
         msg = Message.from_dict(payload)

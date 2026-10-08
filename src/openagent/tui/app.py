@@ -11,13 +11,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import signal
+from types import FrameType
 from typing import Any
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.output import DummyOutput
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
-from rich.prompt import Confirm
+from rich.table import Table
+from rich.text import Text
 
 from openagent import __version__
 from openagent.core.events import (
@@ -33,7 +38,8 @@ from openagent.core.events import (
     ToolResultEvent,
     UsageEvent,
 )
-from openagent.core.types import ToolCall
+from openagent.core.router import ModelReference, ProviderRouter
+from openagent.core.types import ToolCall, Usage
 from openagent.tools.registry import AskCallback
 
 
@@ -46,6 +52,7 @@ class TUIApp:
         self._in_text = False
         self._thinking_buffer: list[str] = []
         self._text_buffer: list[str] = []
+        self.usage = Usage()
 
     def reset_turn(self) -> None:
         """Reset state tracking before starting a new conversation turn."""
@@ -92,34 +99,36 @@ class TUIApp:
                     self._in_text = False
 
                 if call is not None:
-                    name = call.name
+                    name = escape(call.name)
                     args = call.arguments
                     if args:
-                        formatted_args = json.dumps(args, indent=2)
+                        formatted_args = escape(json.dumps(args, indent=2))
                         if "\n" in formatted_args or len(formatted_args) > 60:
                             call_str = f"[bold blue]Tool: {name}[/bold blue] (args:\n[dim]{formatted_args}[/dim])"
                         else:
-                            call_str = f"[bold blue]Tool: {name}[/bold blue] ({json.dumps(args)})"
+                            call_str = (
+                                f"[bold blue]Tool: {name}[/bold blue] ({escape(json.dumps(args))})"
+                            )
                     else:
                         call_str = f"[bold blue]Tool: {name}[/bold blue] ()"
                     self.console.print(call_str, highlight=False)
 
             case ToolResultEvent(tool_name=tool_name, output=output, is_error=is_error):
-                trimmed_output = output
+                trimmed_output = escape(output)
                 if len(output) > 2000:
                     trimmed_output = (
-                        output[:2000]
+                        escape(output[:2000])
                         + f"\n... [dim](output truncated, {len(output) - 2000} more characters)[/dim]"
                     )
 
                 if is_error:
                     self.console.print(
-                        f"[bold red]Tool Error ({tool_name}):[/bold red]\n{trimmed_output}",
+                        f"[bold red]Tool Error ({escape(tool_name)}):[/bold red]\n{trimmed_output}",
                         highlight=False,
                     )
                 else:
                     self.console.print(
-                        f"[bold green]Tool Result ({tool_name}):[/bold green]\n{trimmed_output}",
+                        f"[bold green]Tool Result ({escape(tool_name)}):[/bold green]\n{trimmed_output}",
                         highlight=False,
                     )
 
@@ -131,9 +140,12 @@ class TUIApp:
                     self.console.print()
                     self._in_thinking = False
                     self._in_text = False
-                self.console.print(f"\n[bold red]Error:[/bold red] {error}", highlight=False)
+                self.console.print(
+                    f"\n[bold red]Error:[/bold red] {escape(str(error))}", highlight=False
+                )
 
             case DoneEvent(usage=usage):
+                self.usage = self.usage + usage
                 if self._in_thinking or self._in_text:
                     self.console.print()
                     self._in_thinking = False
@@ -149,6 +161,41 @@ class TUIApp:
                 pass
 
 
+async def _run_repl_turn(runner: Any, user_input: str, ask_cb: AskCallback, app: TUIApp) -> None:
+    """Cancel the current turn on SIGINT while keeping the prompt task alive."""
+
+    async def consume() -> None:
+        async for event in runner.run_turn(user_input, ask_callback=ask_cb):
+            app.render_event(event)
+
+    task = asyncio.create_task(consume())
+    previous = signal.getsignal(signal.SIGINT)
+    interrupted = False
+    installed = False
+    loop = asyncio.get_running_loop()
+
+    def interrupt(signum: int, frame: FrameType | None) -> None:
+        nonlocal interrupted
+        interrupted = True
+        loop.call_soon_threadsafe(task.cancel)
+
+    try:
+        try:
+            signal.signal(signal.SIGINT, interrupt)
+            installed = True
+        except ValueError:
+            pass  # Embedded REPLs may run outside the main thread.
+        try:
+            await task
+        except asyncio.CancelledError:
+            if not interrupted:
+                raise
+            app.console.print("\n[yellow]Turn cancelled by user.[/yellow]")
+    finally:
+        if installed:
+            signal.signal(signal.SIGINT, previous)
+
+
 def make_ask_callback(console: Console | None = None, auto_approve: bool = False) -> AskCallback:
     """Create an interactive ask_callback confirming tool execution with the user."""
     active_console = console if console is not None else Console()
@@ -159,27 +206,16 @@ def make_ask_callback(console: Console | None = None, auto_approve: bool = False
 
         args_str = json.dumps(tool_call.arguments, indent=2) if tool_call.arguments else "{}"
         active_console.print(
-            f"\n[bold yellow]⚠️  Permission Request:[/bold yellow] Tool [cyan]{tool_call.name}[/cyan]"
+            f"\n[bold yellow]⚠️  Permission Request:[/bold yellow] Tool [cyan]{escape(tool_call.name)}[/cyan]"
         )
         if tool_call.arguments:
-            active_console.print(f"[dim]Arguments:\n{args_str}[/dim]")
+            active_console.print(f"[dim]Arguments:\n{escape(args_str)}[/dim]")
 
         try:
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(
-                None,
-                lambda: Confirm.ask(
-                    "Allow tool execution?",
-                    console=active_console,
-                    default=True,
-                ),
+            answer: str = await PromptSession[str](output=None if active_console.is_terminal else DummyOutput()).prompt_async(
+                "Allow tool execution? [y/N] ", handle_sigint=False
             )
-        except RuntimeError:
-            return Confirm.ask(
-                "Allow tool execution?",
-                console=active_console,
-                default=True,
-            )
+            return answer.strip().lower() in ("y", "yes")
         except (EOFError, KeyboardInterrupt):
             return False
 
@@ -200,9 +236,9 @@ async def run_repl(
 
     header_text = (
         f"[bold cyan]OpenAgent[/bold cyan] [dim]v{__version__}[/dim]\n"
-        f"Model: [bold green]{model_name}[/bold green] | "
-        f"Workspace: [dim]{workspace}[/dim] | "
-        f"Session: [dim]{session_id[:8] if len(session_id) > 8 else session_id}[/dim]\n"
+        f"Model: [bold green]{escape(str(model_name))}[/bold green] | "
+        f"Workspace: [dim]{escape(str(workspace))}[/dim] | "
+        f"Session: [dim]{escape(session_id)}[/dim]\n"
         f"[dim]Commands: /exit to quit, /clear to reset context, /help for help[/dim]"
     )
     active_console.print(Panel(header_text, border_style="blue", expand=False))
@@ -221,6 +257,20 @@ async def run_repl(
                 user_input = await session.prompt_async("\nopenagent> ")
             else:
                 user_input = await asyncio.to_thread(input, "\nopenagent> ")
+            multiline = user_input.strip() in ('"""', "'''")
+            if multiline:
+                delimiter = user_input.strip()
+                lines = []
+                while True:
+                    line = (
+                        await session.prompt_async("... ")
+                        if session is not None
+                        else await asyncio.to_thread(input, "... ")
+                    )
+                    if line.strip() == delimiter:
+                        break
+                    lines.append(line)
+                user_input = "\n".join(lines)
         except (KeyboardInterrupt, EOFError):
             active_console.print("\n[yellow]Exiting OpenAgent. Goodbye![/yellow]")
             break
@@ -229,28 +279,94 @@ async def run_repl(
         if not stripped:
             continue
 
-        if stripped.lower() in ("/exit", "/quit", "exit", "quit"):
+        if not multiline and stripped.lower() in ("/exit", "/quit", "exit", "quit"):
             active_console.print("[yellow]Exiting OpenAgent. Goodbye![/yellow]")
             break
 
-        if stripped.lower() == "/clear":
+        if not multiline and stripped.lower() == "/clear":
             runner.reset()
             active_console.print("[green]✔ Context cleared and session reset.[/green]")
             continue
 
-        if stripped.lower() == "/help":
+        if not multiline and stripped.lower() == "/help":
             active_console.print(
                 "[bold]OpenAgent Help:[/bold]\n"
                 "  /clear  - Clear conversation history and reset session\n"
                 "  /exit   - Exit the interactive REPL session\n"
                 "  /quit   - Exit the interactive REPL session\n"
+                "  /model [name] - Display or switch the active provider/model\n"
+                "  /tokens, /usage - Show cumulative REPL usage and context utilization\n"
+                "  /tools - List available tools and danger levels\n"
+                "  Multiline: enter triple quotes on their own line, then close with the same delimiter.\n"
             )
             continue
 
+        if not multiline and stripped.split(maxsplit=1)[0].lower() == "/model":
+            model_ref = stripped.partition(" ")[2].strip()
+            if not model_ref:
+                active_console.print(f"Model: {runner.model}", markup=False)
+                continue
+            try:
+                new_provider = ProviderRouter().resolve(model_ref)
+            except Exception as exc:
+                active_console.print(f"Could not switch model: {exc}", markup=False)
+                continue
+            old_provider = runner.provider
+            ref = ModelReference.parse(model_ref)
+            same_provider = type(new_provider) is type(old_provider) and (
+                ref.provider_hint is None
+                or new_provider.name == old_provider.name
+                or ref.provider_hint == old_provider.name
+            )
+            if same_provider:
+                # Retain the configured gateway, auth headers and custom mappings.
+                target_model = getattr(new_provider, "model", model_ref)
+                await new_provider.close()
+                old_provider.model = target_model
+                runner.model = target_model
+                active_console.print(f"Model: {runner.model} ({old_provider.name})", markup=False)
+                continue
+            explicit_max = getattr(runner, "explicit_max_tokens", None)
+            runner.provider = new_provider
+            runner.model = getattr(new_provider, "model", model_ref)
+            runner.context_window = getattr(
+                new_provider, "context_window", new_provider.default_context_window
+            )
+            runner.max_tokens = (
+                explicit_max if explicit_max is not None else new_provider.default_max_tokens
+            )
+            active_console.print(f"Model: {runner.model} ({new_provider.name})", markup=False)
+            try:
+                await old_provider.close()
+            except Exception as exc:
+                active_console.print(f"Previous provider cleanup failed: {exc}", markup=False)
+            continue
+
+        if not multiline and stripped.lower() in ("/tokens", "/usage"):
+            usage = app.usage
+            context_tokens = runner.messages.total_tokens()
+            context_window = runner.context_window
+            percent = context_tokens / context_window * 100 if context_window else 0
+            active_console.print(
+                f"Prompt: {usage.prompt_tokens} | Completion: {usage.completion_tokens} | Total: {usage.total_tokens}\n"
+                f"Context: {context_tokens} / {context_window} tokens ({percent:.1f}%)",
+                markup=False,
+            )
+            continue
+
+        if not multiline and stripped.lower() == "/tools":
+            table = Table(title="Available Tools")
+            table.add_column("Name")
+            table.add_column("Description")
+            table.add_column("Danger")
+            for spec in runner.tools.list_specs():
+                table.add_row(Text(spec.name), Text(spec.description), Text(spec.danger))
+            active_console.print(table)
+            continue
+
         try:
-            async for event in runner.run_turn(user_input, ask_callback=ask_cb):
-                app.render_event(event)
+            await _run_repl_turn(runner, user_input, ask_cb, app)
         except KeyboardInterrupt:
             active_console.print("\n[yellow]Turn cancelled by user.[/yellow]")
         except Exception as exc:
-            active_console.print(f"\n[bold red]✖ Unexpected error: {exc}[/bold red]")
+            active_console.print(f"\n[bold red]✖ Unexpected error: {escape(str(exc))}[/bold red]")

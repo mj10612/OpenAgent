@@ -17,7 +17,9 @@ import time
 from collections.abc import Sequence
 
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
+from rich.prompt import Confirm
 from rich.table import Table
 
 from openagent import __version__
@@ -158,11 +160,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     # sessions subcommand
-    subparsers.add_parser(
+    sessions_parser = subparsers.add_parser(
         "sessions",
         parents=[common_parser],
         help="List past conversation sessions and resumption commands",
     )
+    sessions_parser.add_argument(
+        "session_action", nargs="?", choices=["list", "delete", "rm", "prune"], default="list"
+    )
+    sessions_parser.add_argument("session_target", nargs="?")
+    sessions_parser.add_argument("--older-than", type=float, dest="older_than_days")
+    sessions_parser.add_argument("--clear", action="store_true")
 
     # config subcommand
     subparsers.add_parser(
@@ -201,9 +209,32 @@ def _cmd_models(console: Console) -> int:
     return 0
 
 
-def _cmd_sessions(console: Console) -> int:
+def _cmd_sessions(console: Console, args: argparse.Namespace | None = None) -> int:
     session_dir = os.environ.get("OPENAGENT_SESSION_DIR")
     store = SessionStore(storage_dir=session_dir)
+    action = getattr(args, "session_action", "list")
+    clear = getattr(args, "clear", False)
+    if action in ("delete", "rm") or action == "prune" or clear:
+        target = getattr(args, "session_target", None)
+        if action in ("delete", "rm") and not target:
+            raise ValueError("Session ID is required: openagent sessions delete <id>")
+        older_than = getattr(args, "older_than_days", None)
+        if action == "prune" and older_than is None and not clear:
+            raise ValueError("Use sessions prune --older-than <days> or sessions --clear")
+        resolved = store.resolve_session_id(str(target)) if action in ("delete", "rm") else None
+        if not getattr(args, "yes", False) and not Confirm.ask(
+            "Delete selected sessions?", console=console, default=False
+        ):
+            console.print("Cancelled.")
+            return 0
+        if resolved is not None:
+            if not store.delete_session(resolved):
+                raise FileNotFoundError(f"Session '{resolved}' was not found")
+            console.print(f"Deleted session {resolved}", markup=False)
+        else:
+            count = store.cleanup_sessions(older_than_days=None if clear else older_than)
+            console.print(f"Deleted {count} session(s).", markup=False)
+        return 0
     sessions = store.list_sessions()
 
     if not sessions:
@@ -226,12 +257,12 @@ def _cmd_sessions(console: Console) -> int:
         created_dt = time.strftime("%Y-%m-%d %H:%M", time.localtime(s.created_at))
         updated_dt = time.strftime("%Y-%m-%d %H:%M", time.localtime(s.updated_at))
         table.add_row(
-            s.session_id[:8],
+            s.session_id,
             created_dt,
             updated_dt,
-            s.model or "-",
+            escape(s.model) if s.model else "-",
             str(s.message_count),
-            s.title or "-",
+            escape(s.title) if s.title else "-",
         )
     console.print(table)
     console.print(
@@ -452,7 +483,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.subcommand == "models":
             return _cmd_models(console)
         elif args.subcommand == "sessions":
-            return _cmd_sessions(console)
+            return _cmd_sessions(console, args)
         elif args.subcommand == "config":
             return _cmd_config(console, args)
         elif args.subcommand in ("run", "chat"):
@@ -464,7 +495,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         console.print("\n[yellow]Interrupted by user.[/yellow]")
         return 130
     except Exception as exc:
-        console.print(f"\n[bold red]Error:[/bold red] {exc}")
+        console.print(f"\n[bold red]Error:[/bold red] {escape(str(exc))}")
         return 1
 
 

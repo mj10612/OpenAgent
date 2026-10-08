@@ -14,6 +14,8 @@ import json
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
+import httpx
+
 from ..core.events import (
     DoneEvent,
     ErrorEvent,
@@ -69,8 +71,10 @@ class GeminiProvider(ChatProvider):
         max_retries: int = 3,
         extra_headers: Mapping[str, str] | None = None,
         context_window: int | None = None,
+        extra_body: Mapping[str, Any] | None = None,
         client: Any = None,
     ) -> None:
+        self.extra_body = dict(extra_body or {})
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -110,7 +114,10 @@ class GeminiProvider(ChatProvider):
                         "response": {"output": msg.tool_text()},
                     }
                 }
-                contents.append({"role": "user", "parts": [part]})
+                if contents and contents[-1]["role"] == "user":
+                    contents[-1]["parts"].append(part)
+                else:
+                    contents.append({"role": "user", "parts": [part]})
                 continue
 
             role = "model" if msg.role == "assistant" else "user"
@@ -127,40 +134,47 @@ class GeminiProvider(ChatProvider):
                         parts.append({"text": t, "thought": True})
                     case ImagePart(data=d, mime_type=m):
                         if d and m:
-                            parts.append({
-                                "inline_data": {
-                                    "mime_type": m,
-                                    "data": d,
+                            parts.append(
+                                {
+                                    "inline_data": {
+                                        "mime_type": m,
+                                        "data": d,
+                                    }
                                 }
-                            })
+                            )
 
             for call in msg.tool_calls:
-                parts.append({
-                    "functionCall": {
-                        "name": call.name,
-                        "args": call.arguments or {},
+                parts.append(
+                    {
+                        "functionCall": {
+                            "name": call.name,
+                            "args": call.arguments or {},
+                        }
                     }
-                })
+                )
 
             if parts:
-                contents.append({"role": role, "parts": parts})
+                if contents and contents[-1]["role"] == role:
+                    contents[-1]["parts"].extend(parts)
+                else:
+                    contents.append({"role": role, "parts": parts})
 
         payload: dict[str, Any] = {
             "contents": contents,
         }
 
         if system_text:
-            payload["system_instruction"] = {
-                "parts": [{"text": system_text}]
-            }
+            payload["system_instruction"] = {"parts": [{"text": system_text}]}
 
         generation_config: dict[str, Any] = {}
         if request.temperature is not None:
             generation_config["temperature"] = request.temperature
         if request.top_p is not None:
             generation_config["topP"] = request.top_p
-        if request.max_tokens is not None:
-            generation_config["maxOutputTokens"] = request.max_tokens
+        if request.max_tokens is not None or self.default_max_tokens is not None:
+            generation_config["maxOutputTokens"] = (
+                request.max_tokens if request.max_tokens is not None else self.default_max_tokens
+            )
         if request.stop:
             generation_config["stopSequences"] = list(request.stop)
         if generation_config:
@@ -175,6 +189,7 @@ class GeminiProvider(ChatProvider):
             elif request.tool_choice == "none":
                 payload.pop("tools", None)
 
+        payload.update(self.extra_body)
         return payload
 
     # -- streaming ---------------------------------------------------------- #
@@ -222,7 +237,9 @@ class GeminiProvider(ChatProvider):
                     meta = chunk["usageMetadata"]
                     usage = Usage(
                         prompt_tokens=int(meta.get("promptTokenCount", usage.prompt_tokens)),
-                        completion_tokens=int(meta.get("candidatesTokenCount", usage.completion_tokens)),
+                        completion_tokens=int(
+                            meta.get("candidatesTokenCount", usage.completion_tokens)
+                        ),
                     )
                     yield UsageEvent(usage=usage)
 
@@ -235,7 +252,13 @@ class GeminiProvider(ChatProvider):
                                 finish_reason = FinishReason.STOP
                             case "MAX_TOKENS":
                                 finish_reason = FinishReason.LENGTH
-                            case "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII":
+                            case (
+                                "SAFETY"
+                                | "RECITATION"
+                                | "BLOCKLIST"
+                                | "PROHIBITED_CONTENT"
+                                | "SPII"
+                            ):
                                 finish_reason = FinishReason.CONTENT_FILTER
                             case _:
                                 finish_reason = FinishReason.STOP
@@ -283,6 +306,11 @@ class GeminiProvider(ChatProvider):
                 ),
                 usage=usage,
             )
+        except httpx.HTTPError as exc:
+            error = ProviderError(f"network error: {exc}", retryable=True, provider=self.name)
+            yield ErrorEvent(error=error, retryable=True)
+        except ProviderError as exc:
+            yield ErrorEvent(error=exc, retryable=exc.retryable)
         finally:
             await response.aclose()
 

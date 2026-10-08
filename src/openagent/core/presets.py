@@ -160,6 +160,7 @@ BUILTIN_PRESETS: dict[str, ProviderPreset] = {
             context_window=131_072,
             supports_vision=True,
             default_model="grok-2-latest",
+            aliases=("grok", "x-ai"),
         ),
         _p(
             "mistral",
@@ -211,14 +212,6 @@ BUILTIN_PRESETS: dict[str, ProviderPreset] = {
             context_window=128_000,
             supports_vision=True,
             default_model="sonar-pro",
-        ),
-        _p(
-            "grok",
-            "https://api.x.ai/v1",
-            auth=AuthScheme("bearer", env=("XAI_API_KEY",)),
-            context_window=131_072,
-            default_model="grok-2-latest",
-            aliases=("x-ai",),
         ),
         _p(
             "cerebras",
@@ -359,18 +352,9 @@ PRESETS: dict[str, ProviderPreset] = all_presets()
 
 def find_preset(name: str) -> ProviderPreset | None:
     """Look up a preset by name, alias, or conventional spelling."""
-    key = name.strip().lower().replace("_", "-")
-    table = all_presets()
-    if key in table:
-        return table[key]
-    for preset in table.values():
-        if key in preset.aliases:
-            return preset
-    # Tolerate singular/plural drift ("groqs", "xais").
-    for candidate in (key.rstrip("s"), f"{key}s"):
-        if candidate in table:
-            return table[candidate]
-    return None
+    from .router import ProviderRouter
+
+    return ProviderRouter()._find_preset(name)
 
 
 def preset_names() -> list[str]:

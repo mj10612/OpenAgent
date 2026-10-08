@@ -1,4 +1,4 @@
-"""Tests for MCP (Model Context Protocol) client and manager integration.
+﻿"""Tests for MCP (Model Context Protocol) client and manager integration.
 
 Copyright 2026 The OpenAgent Contributors
 Licensed under the Apache License, Version 2.0.
@@ -318,7 +318,7 @@ def test_mcp_tool_danger_inference_from_annotations() -> None:
         annotations=types.ToolAnnotations(read_only_hint=True),
     )
     t1 = MCPTool(client=client, tool_def=ro_tool_def)
-    assert t1.danger == "none"
+    assert t1.danger == "execute"
 
     dest_tool_def = types.Tool(
         name="destructive_tool",
@@ -431,6 +431,7 @@ async def test_mcp_manager_multi_server_lifecycle_and_registry() -> None:
 
     manager = MCPManager(
         registry=registry,
+        prefix_tool_names=False,
         configs=[cfg1, cfg2],
         client_factory=client_factory,
     )
@@ -479,6 +480,7 @@ async def test_mcp_manager_error_isolation() -> None:
 
     manager = MCPManager(
         registry=registry,
+        prefix_tool_names=False,
         configs=[cfg_good, cfg_bad],
         client_factory=client_factory,
     )
@@ -510,6 +512,7 @@ async def test_mcp_manager_async_context_manager() -> None:
 
     manager = MCPManager(
         registry=registry,
+        prefix_tool_names=False,
         configs=[cfg],
         client_factory=lambda _: mock_client,
     )

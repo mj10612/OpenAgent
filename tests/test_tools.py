@@ -80,7 +80,7 @@ def test_tool_result_creation_and_to_message() -> None:
     assert msg.role == "tool"
     assert msg.tool_call_id == "call_123"
     assert msg.name == "test_tool"
-    assert msg.text == "hello world"
+    assert msg.text == "<tool_output>\nhello world\n</tool_output>"
     assert not msg.is_error
 
     err_res = ToolResult(call_id="call_456", output="file not found", is_error=True)
@@ -135,7 +135,7 @@ async def test_tool_registry_default_danger_policies() -> None:
     echo = DummyEchoTool()  # danger="none" -> ALLOW
     writer = DummyDangerousWriteTool()  # danger="write" -> ASK
     executor = DummyDangerousExecTool()  # danger="execute" -> ASK
-    web = WebFetchTool()  # danger="network" -> ALLOW
+    web = WebFetchTool()  # danger="network" -> ASK
 
     reg.register(echo)
     reg.register(writer)
@@ -407,6 +407,7 @@ async def test_shell_tool_successful_execution(tmp_path: Path) -> None:
     res_helper = await execute_shell(
         command="python -c \"print('Hello from helper')\"",
         cwd=tmp_path,
+        workspace_root=tmp_path,
     )
     assert not res_helper.is_error
     assert "Hello from helper" in res_helper.output
@@ -492,11 +493,12 @@ async def test_web_fetch_tool_success() -> None:
 
     mock_resp = httpx.Response(
         status_code=200,
-        html=html_content,
+        stream=httpx.ByteStream(html_content.encode()),
+        headers={"content-type": "text/html"},
         request=httpx.Request("GET", "https://example.com"),
     )
 
-    with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=mock_resp)):
+    with patch.object(httpx.AsyncClient, "send", AsyncMock(return_value=mock_resp)), patch("openagent.tools.agent_tools._public_address", AsyncMock(return_value="93.184.216.34")):
         res = await web.execute(url="https://example.com")
         assert not res.is_error
         assert "Hello World" in res.output
@@ -508,11 +510,11 @@ async def test_web_fetch_tool_http_error() -> None:
     web = WebFetchTool()
     mock_resp = httpx.Response(
         status_code=404,
-        text="Not Found",
+        stream=httpx.ByteStream(b"Not Found"),
         request=httpx.Request("GET", "https://example.com/notfound"),
     )
 
-    with patch.object(httpx.AsyncClient, "get", AsyncMock(return_value=mock_resp)):
+    with patch.object(httpx.AsyncClient, "send", AsyncMock(return_value=mock_resp)), patch("openagent.tools.agent_tools._public_address", AsyncMock(return_value="93.184.216.34")):
         res = await web.execute(url="https://example.com/notfound")
         assert res.is_error
         assert "404" in res.output

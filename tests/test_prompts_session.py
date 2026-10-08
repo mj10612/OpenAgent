@@ -312,7 +312,7 @@ def test_session_store_roundtrip_full_fidelity(tmp_path: Path) -> None:
             ThinkingPart(text="Let me inspect the file first.", signature="sig_abc"),
             TextPart(text="Reading the file now."),
         ],
-        tool_calls=[tc1, tc2],
+        tool_calls=[tc1, tc2, ToolCall(id="call_part_789", name="status_check", arguments={})],
         reasoning="Step 1 is inspecting the entrypoint.",
         created_at=t3,
         metadata={"finish_reason": "tool_calls"},

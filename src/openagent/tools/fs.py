@@ -8,11 +8,65 @@ Licensed under the Apache License, Version 2.0.
 
 from __future__ import annotations
 
+import fnmatch
+import os
+import shutil
+import tempfile
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
 from openagent.core.types import ToolParam
 from openagent.tools.base import DangerLevel, Tool, ToolResult
+
+MAX_FILE_BYTES = 2 * 1024 * 1024
+MAX_SCAN_ITEMS = 10000
+MAX_OUTPUT_CHARS = 100000
+DEFAULT_IGNORES = {".git", ".venv", "venv", "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache", "dist", "build", ".tox"}
+
+
+def _read_bounded(target: Path) -> bytes:
+    with target.open("rb") as stream:
+        data = stream.read(MAX_FILE_BYTES + 1)
+    if len(data) > MAX_FILE_BYTES:
+        raise ValueError("File exceeds 2 MB size limit")
+    return data
+
+
+def _walk(root: Path, workspace: Path):
+    """Bound traversal and prune dependency directories and symlinks before descent."""
+    count = 0
+    for directory, dirs, files in os.walk(root, followlinks=False):
+        dirs[:] = sorted(d for d in dirs if d not in DEFAULT_IGNORES and not (Path(directory) / d).is_symlink())
+        for name in sorted(dirs + files):
+            item = Path(directory) / name
+            if item.is_symlink() or not item.resolve().is_relative_to(workspace):
+                continue
+            yield item
+            count += 1
+            if count >= MAX_SCAN_ITEMS:
+                return
+
+
+def _atomic_write(target: Path, content: str, overwrite: bool = True) -> None:
+    """Write UTF-8 bytes without newline translation; publish only complete content."""
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(content.encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        if target.exists():
+            shutil.copymode(target, temporary)
+        if overwrite:
+            os.replace(temporary, target)
+        else:
+            # Hard-link publication preserves exclusive-create semantics under races.
+            os.link(temporary, target)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def resolve_sandboxed_path(workspace_root: Path, path: str | Path) -> Path:
@@ -75,7 +129,7 @@ class ReadFileTool(BaseFSTool):
         call_id = str(kwargs.get("call_id", ""))
         path = str(kwargs.get("path", ""))
         offset = int(kwargs.get("offset", 1))
-        limit = int(kwargs.get("limit", 2000))
+        limit = max(1, min(int(kwargs.get("limit", 2000)), 2000))
 
         if not path:
             return ToolResult(call_id=call_id, output="Parameter 'path' is required.", is_error=True)
@@ -99,7 +153,12 @@ class ReadFileTool(BaseFSTool):
             )
 
         try:
-            content = target.read_text(encoding="utf-8", errors="replace")
+            if target.stat().st_size > MAX_FILE_BYTES:
+                raise ValueError("File exceeds 2 MB size limit")
+            data = _read_bounded(target)
+            if b"\x00" in data[:8192]:
+                raise ValueError("Binary files cannot be read as text")
+            content = data.decode("utf-8", errors="replace")
         except Exception as exc:
             return ToolResult(
                 call_id=call_id,
@@ -113,7 +172,7 @@ class ReadFileTool(BaseFSTool):
         selected_lines = lines[start_idx - 1 : end_idx]
 
         formatted = [f"{i}: {line}" for i, line in enumerate(selected_lines, start=start_idx)]
-        return ToolResult(call_id=call_id, output="\n".join(formatted))
+        return ToolResult(call_id=call_id, output="\n".join(formatted)[:MAX_OUTPUT_CHARS])
 
 
 class WriteFileTool(BaseFSTool):
@@ -166,7 +225,7 @@ class WriteFileTool(BaseFSTool):
 
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
+            _atomic_write(target, content, overwrite=overwrite)
         except Exception as exc:
             return ToolResult(
                 call_id=call_id,
@@ -231,7 +290,7 @@ class EditFileTool(BaseFSTool):
             )
 
         try:
-            content = target.read_text(encoding="utf-8")
+            content = _read_bounded(target).decode("utf-8")
         except Exception as exc:
             return ToolResult(
                 call_id=call_id,
@@ -239,6 +298,10 @@ class EditFileTool(BaseFSTool):
                 is_error=True,
             )
 
+        crlf_only = "\r\n" in content and content.count("\r\n") == content.count("\n")
+        if crlf_only:
+            old_str = old_str.replace("\r\n", "\n").replace("\n", "\r\n")
+            new_str = new_str.replace("\r\n", "\n").replace("\n", "\r\n")
         occurrences = content.count(old_str)
         if occurrences == 0:
             return ToolResult(
@@ -255,7 +318,7 @@ class EditFileTool(BaseFSTool):
 
         new_content = content.replace(old_str, new_str, 1)
         try:
-            target.write_text(new_content, encoding="utf-8")
+            _atomic_write(target, new_content)
         except Exception as exc:
             return ToolResult(
                 call_id=call_id,
@@ -303,7 +366,7 @@ class ListDirectoryTool(BaseFSTool):
         call_id = str(kwargs.get("call_id", ""))
         path = str(kwargs.get("path", "."))
         recursive = bool(kwargs.get("recursive", False))
-        max_items = int(kwargs.get("max_items", 200))
+        max_items = max(1, min(int(kwargs.get("max_items", 200)), 1000))
 
         try:
             target = self._resolve(path)
@@ -318,7 +381,8 @@ class ListDirectoryTool(BaseFSTool):
             )
 
         try:
-            entries = sorted(target.rglob("*")) if recursive else sorted(target.iterdir())
+            source = _walk(target, self.workspace_root) if recursive else (p for p in target.iterdir() if not p.is_symlink())
+            entries = list(islice(source, max_items + 1))
         except Exception as exc:
             return ToolResult(
                 call_id=call_id,
@@ -340,7 +404,7 @@ class ListDirectoryTool(BaseFSTool):
                 continue
 
         if total > max_items:
-            lines.append(f"... (truncated, showing {max_items} of {total} items)")
+            lines.append(f"... (truncated, showing {max_items} items)")
 
         output = "\n".join(lines) if lines else "(empty directory)"
         return ToolResult(call_id=call_id, output=output)
@@ -388,7 +452,9 @@ class GlobFindTool(BaseFSTool):
             )
 
         try:
-            matches = sorted(target.glob(pattern))
+            if not pattern or Path(pattern).is_absolute() or ".." in Path(pattern).parts:
+                raise ValueError("Pattern must stay within the search directory")
+            matches = [p for p in _walk(target, self.workspace_root) if p.match(pattern) or fnmatch.fnmatch(str(p.relative_to(target)), pattern)]
         except Exception as exc:
             return ToolResult(
                 call_id=call_id,
@@ -406,7 +472,7 @@ class GlobFindTool(BaseFSTool):
 
         if not rel_paths:
             return ToolResult(call_id=call_id, output="No files matched pattern.")
-        return ToolResult(call_id=call_id, output="\n".join(rel_paths))
+        return ToolResult(call_id=call_id, output="\n".join(rel_paths[:1000])[:MAX_OUTPUT_CHARS])
 
 
 class GrepSearchTool(BaseFSTool):
@@ -451,7 +517,7 @@ class GrepSearchTool(BaseFSTool):
         except PermissionError as exc:
             return ToolResult(call_id=call_id, output=str(exc), is_error=True)
 
-        if not target.exists() or not target.is_dir():
+        if not target.exists():
             return ToolResult(
                 call_id=call_id,
                 output=f"Directory not found: '{path}'",
@@ -459,7 +525,7 @@ class GrepSearchTool(BaseFSTool):
             )
 
         matches: list[str] = []
-        target_files = sorted(target.rglob("*")) if target.is_dir() else [target]
+        target_files = _walk(target, self.workspace_root) if target.is_dir() else [target]
 
         query_cmp = query if case_sensitive else query.lower()
 
@@ -472,7 +538,12 @@ class GrepSearchTool(BaseFSTool):
             except Exception:
                 continue
             try:
-                content = f.read_text(encoding="utf-8", errors="ignore")
+                if f.stat().st_size > MAX_FILE_BYTES:
+                    continue
+                data = _read_bounded(f)
+                if b"\x00" in data[:8192]:
+                    continue
+                content = data.decode("utf-8")
             except Exception:
                 continue
 
@@ -483,7 +554,7 @@ class GrepSearchTool(BaseFSTool):
                         rel = f.relative_to(self.workspace_root)
                     except ValueError:
                         rel = f
-                    matches.append(f"{rel}:{idx}: {line}")
+                    matches.append(f"{rel}:{idx}: {line[:2000]}")
                     if len(matches) >= 500:
                         matches.append("... (truncated at 500 matches)")
                         break
@@ -492,7 +563,56 @@ class GrepSearchTool(BaseFSTool):
 
         if not matches:
             return ToolResult(call_id=call_id, output="No matches found for query.")
-        return ToolResult(call_id=call_id, output="\n".join(matches))
+        return ToolResult(call_id=call_id, output="\n".join(matches)[:MAX_OUTPUT_CHARS])
+
+
+class DeleteFileTool(BaseFSTool):
+    """Delete a regular file within the workspace; never remove directories."""
+    name = "delete_file"
+    description = "Delete a file within the workspace."
+    danger: DangerLevel = "write"
+
+    def __init__(self, workspace_root: Path | str) -> None:
+        super().__init__(workspace_root)
+        self.params = [ToolParam(name="path", type="string", description="File to delete")]
+
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        call_id = str(kwargs.get("call_id", ""))
+        try:
+            target = self._resolve(kwargs.get("path", ""))
+            if not target.is_file():
+                raise ValueError("Path is not a regular file")
+            target.unlink()
+            return ToolResult(call_id, "Successfully deleted file.")
+        except Exception as exc:
+            return ToolResult(call_id, str(exc), True)
+
+
+class MoveFileTool(BaseFSTool):
+    """Move a regular file, refusing to overwrite any existing destination."""
+    name = "move_file"
+    description = "Move or rename a file within the workspace without overwriting."
+    danger: DangerLevel = "write"
+
+    def __init__(self, workspace_root: Path | str) -> None:
+        super().__init__(workspace_root)
+        self.params = [ToolParam(name="source", type="string", description="Source file"), ToolParam(name="destination", type="string", description="Destination file")]
+
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        call_id = str(kwargs.get("call_id", ""))
+        try:
+            source = self._resolve(kwargs.get("source", ""))
+            destination = self._resolve(kwargs.get("destination", ""))
+            if not source.is_file():
+                raise ValueError("Source is not a regular file")
+            if destination.exists():
+                raise FileExistsError("Destination already exists")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.link(source, destination)
+            source.unlink()
+            return ToolResult(call_id, "Successfully moved file.")
+        except Exception as exc:
+            return ToolResult(call_id, str(exc), True)
 
 
 def create_fs_tools(workspace_root: Path | str) -> list[Tool]:
@@ -504,4 +624,6 @@ def create_fs_tools(workspace_root: Path | str) -> list[Tool]:
         ListDirectoryTool(workspace_root),
         GlobFindTool(workspace_root),
         GrepSearchTool(workspace_root),
+        DeleteFileTool(workspace_root),
+        MoveFileTool(workspace_root),
     ]

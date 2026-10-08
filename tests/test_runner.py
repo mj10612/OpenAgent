@@ -233,7 +233,7 @@ async def test_runner_multi_step_tool_loop() -> None:
     assert runner.messages[3].role == "tool"
     assert runner.messages[3].tool_call_id == "call_123"
     assert runner.messages[3].name == "add"
-    assert runner.messages[3].text == "42"
+    assert runner.messages[3].text == "<tool_output>\n42\n</tool_output>"
     assert runner.messages[4].role == "assistant"
     assert runner.messages[4].text == "The sum is 42."
 

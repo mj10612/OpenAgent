@@ -286,14 +286,14 @@ async def test_tui_ask_callback_auto_approve() -> None:
 @pytest.mark.asyncio
 async def test_tui_ask_callback_prompt_yes_and_no() -> None:
     # Test answering yes
-    with patch("rich.prompt.Confirm.ask", return_value=True):
+    with patch("prompt_toolkit.PromptSession.prompt_async", new=AsyncMock(return_value="yes")):
         cb = make_ask_callback(console=Console(), auto_approve=False)
         call = ToolCall(id="call_1", name="execute_command", arguments={"command": "dir"})
         res = await _invoke_callback(cb, call)
         assert res is True
 
     # Test answering no
-    with patch("rich.prompt.Confirm.ask", return_value=False):
+    with patch("prompt_toolkit.PromptSession.prompt_async", new=AsyncMock(return_value="no")):
         cb = make_ask_callback(console=Console(), auto_approve=False)
         call = ToolCall(id="call_1", name="execute_command", arguments={"command": "dir"})
         res = await _invoke_callback(cb, call)

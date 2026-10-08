@@ -13,6 +13,7 @@ import json
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
+import httpx
 import jsonpath_ng
 
 from ..core.events import (
@@ -120,7 +121,9 @@ class CustomJsonPathProvider(ChatProvider):
 
     # -- chunk parsing ------------------------------------------------------ #
 
-    def parse_chunk(self, chunk: dict[str, Any]) -> list[StreamEvent]:
+    def parse_chunk(
+        self, chunk: dict[str, Any], partials: dict[int, dict[str, str]] | None = None
+    ) -> list[StreamEvent]:
         """Tolerantly extract events from a parsed JSON chunk."""
         events: list[StreamEvent] = []
 
@@ -145,44 +148,47 @@ class CustomJsonPathProvider(ChatProvider):
         if self._tool_calls_expr:
             try:
                 matches = self._tool_calls_expr.find(chunk)
-                for m in matches:
-                    val = m.value
-                    if isinstance(val, dict):
-                        calls = [val]
-                    elif isinstance(val, list):
-                        calls = [c for c in val if isinstance(c, dict)]
-                    else:
-                        continue
-
-                    for idx, c in enumerate(calls):
-                        fn = c.get("function")
-                        if isinstance(fn, dict):
-                            call_name = fn.get("name", "")
-                            call_args = fn.get("arguments") or {}
+                call_number = 0
+                for match in matches:
+                    values = match.value if isinstance(match.value, list) else [match.value]
+                    for c in values:
+                        if not isinstance(c, dict):
+                            continue
+                        fn = c.get("function") or c
+                        index = int(c.get("index", call_number))
+                        call_number += 1
+                        name = fn.get("name", "")
+                        args = fn.get("arguments", fn.get("args", ""))
+                        raw = (
+                            json.dumps(args) if isinstance(args, (dict, list)) else str(args or "")
+                        )
+                        call_id = c.get("id") or f"call_{index}"
+                        if partials is not None:
+                            slot = partials.setdefault(index, {"id": "", "name": "", "args": ""})
+                            if name and not slot["name"]:
+                                events.append(ToolCallStart(index=index, id=call_id, name=name))
+                            slot["name"] += name
+                            if c.get("id"):
+                                slot["id"] = call_id
+                            slot["args"] += raw
+                            if raw:
+                                events.append(ToolCallDelta(index=index, arguments_delta=raw))
                         else:
-                            call_name = c.get("name", "")
-                            call_args = c.get("arguments") or c.get("args") or {}
-
-                        call_id = c.get("id") or f"call_{idx}"
-                        raw_args = (
-                            json.dumps(call_args)
-                            if isinstance(call_args, (dict, list))
-                            else str(call_args)
-                        )
-                        parsed_args = coerce_arguments(call_args)
-
-                        tool_index = c.get("index", idx)
-                        events.append(ToolCallStart(index=tool_index, id=call_id, name=call_name))
-                        events.append(ToolCallDelta(index=tool_index, arguments_delta=raw_args))
-                        tc = ToolCall(
-                            id=call_id,
-                            name=call_name,
-                            arguments=parsed_args,
-                            raw_arguments=raw_args,
-                        )
-                        events.append(ToolCallEnd(index=tool_index, call=tc))
-            except Exception:
-                pass
+                            events.append(ToolCallStart(index=index, id=call_id, name=name))
+                            events.append(ToolCallDelta(index=index, arguments_delta=raw))
+                            call = ToolCall(
+                                name=name,
+                                arguments=coerce_arguments(raw),
+                                id=call_id,
+                                raw_arguments=raw,
+                            )
+                            events.append(ToolCallEnd(index=index, call=call))
+            except (ProviderError, ValueError, TypeError) as exc:
+                events.append(
+                    ErrorEvent(
+                        error=ProviderError(f"could not parse tool call: {exc}", provider=self.name)
+                    )
+                )
 
         # 3. Usage
         prompt_tokens: int | None = None
@@ -218,10 +224,30 @@ class CustomJsonPathProvider(ChatProvider):
 
     # -- streaming ---------------------------------------------------------- #
 
+    @staticmethod
+    def _render_message(message: Message) -> dict[str, Any]:
+        out: dict[str, Any] = {"role": message.role, "content": message.text}
+        if message.role == "assistant" and message.tool_calls:
+            out["content"] = message.text or None
+            out["tool_calls"] = [
+                {
+                    "id": c.id,
+                    "type": "function",
+                    "function": {
+                        "name": c.name,
+                        "arguments": c.raw_arguments or json.dumps(c.arguments),
+                    },
+                }
+                for c in message.tool_calls
+            ]
+        if message.role == "tool":
+            out["tool_call_id"] = message.tool_call_id or ""
+        return out
+
     def build_payload(self, request: ChatRequest) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": request.model,
-            "messages": [{"role": m.role, "content": m.text} for m in request.messages],
+            "messages": [self._render_message(m) for m in request.messages],
             "stream": True,
         }
         if request.temperature is not None:
@@ -248,6 +274,7 @@ class CustomJsonPathProvider(ChatProvider):
             text_parts: list[str] = []
             thinking_parts: list[str] = []
             calls: list[ToolCall] = []
+            partials: dict[int, dict[str, str]] = {}
             usage = Usage()
 
             content_type = response.headers.get("content-type", "").lower()
@@ -263,7 +290,10 @@ class CustomJsonPathProvider(ChatProvider):
                         chunk = json.loads(event.data)
                     except json.JSONDecodeError:
                         continue
-                    for ev in self.parse_chunk(chunk):
+                    for ev in self.parse_chunk(chunk, partials):
+                        if isinstance(ev, ErrorEvent):
+                            yield ev
+                            return
                         match ev:
                             case ThinkingDelta(text=t):
                                 thinking_parts.append(t)
@@ -292,7 +322,10 @@ class CustomJsonPathProvider(ChatProvider):
                         chunk = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    for ev in self.parse_chunk(chunk):
+                    for ev in self.parse_chunk(chunk, partials):
+                        if isinstance(ev, ErrorEvent):
+                            yield ev
+                            return
                         match ev:
                             case ThinkingDelta(text=t):
                                 thinking_parts.append(t)
@@ -309,6 +342,15 @@ class CustomJsonPathProvider(ChatProvider):
                             case _:
                                 yield ev
 
+            for index, slot in sorted(partials.items()):
+                call = ToolCall(
+                    slot["name"],
+                    coerce_arguments(slot["args"]),
+                    id=slot["id"] or f"call_{index}",
+                    raw_arguments=slot["args"],
+                )
+                calls.append(call)
+                yield ToolCallEnd(index=index, call=call)
             finish = FinishReason.TOOL_CALLS if calls else FinishReason.STOP
             yield DoneEvent(
                 finish_reason=finish,
@@ -319,6 +361,11 @@ class CustomJsonPathProvider(ChatProvider):
                 ),
                 usage=usage,
             )
+        except httpx.HTTPError as exc:
+            error = ProviderError(f"network error: {exc}", retryable=True, provider=self.name)
+            yield ErrorEvent(error=error, retryable=True)
+        except ProviderError as exc:
+            yield ErrorEvent(error=exc, retryable=exc.retryable)
         finally:
             await response.aclose()
 

@@ -10,8 +10,11 @@ Licensed under the Apache License, Version 2.0.
 from __future__ import annotations
 
 import asyncio
+import math
 import random
 from collections.abc import AsyncIterator, Mapping
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from types import TracebackType
 from typing import Any, Self
 
@@ -47,7 +50,9 @@ AUTH_MARKERS = ("unauthorized", "invalid api key", "invalid_api_key", "authentic
 NOT_FOUND_MARKERS = ("model not found", "does not exist", "unknown model", "model_not_found")
 
 
-def classify(status: int, info: ErrorInfo, *, provider: str) -> ProviderError:
+def classify(
+    status: int, info: ErrorInfo, *, provider: str, retry_after: float | None = None
+) -> ProviderError:
     """Map an HTTP status plus error body onto a typed exception."""
     message = info.message or f"HTTP {status}"
     haystack = message.lower()
@@ -59,7 +64,7 @@ def classify(status: int, info: ErrorInfo, *, provider: str) -> ProviderError:
     if any(m in haystack for m in CONTEXT_MARKERS):
         return ContextWindowError(message, status=status, provider=provider)
     if status == 429:
-        return RateLimitError(message, status=status, provider=provider)
+        return RateLimitError(message, status=status, provider=provider, retry_after=retry_after)
     retryable = status in RETRYABLE_STATUS
     return ProviderError(message, status=status, retryable=retryable, provider=provider)
 
@@ -90,7 +95,7 @@ class HttpTransport:
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
             timeout=httpx.Timeout(timeout, connect=connect_timeout),
-            follow_redirects=True,
+            follow_redirects=False,
             limits=httpx.Limits(max_connections=64, max_keepalive_connections=16),
         )
 
@@ -132,21 +137,33 @@ class HttpTransport:
 
         for attempt in range(self.max_retries + 1):
             try:
-                response = await self._client.post(url, json=body, headers=merged)
+                response = await self._client.post(
+                    url, json=body, headers=merged, follow_redirects=False
+                )
             except httpx.TimeoutException as exc:
-                last_error = ProviderError(f"request timed out: {exc}", retryable=True, provider=self.provider)
+                last_error = ProviderError(
+                    f"request timed out: {exc}", retryable=True, provider=self.provider
+                )
             except httpx.HTTPError as exc:
-                last_error = ProviderError(f"network error: {exc}", retryable=True, provider=self.provider)
+                last_error = ProviderError(
+                    f"network error: {exc}", retryable=True, provider=self.provider
+                )
             else:
+                self._reject_redirect(response)
                 if response.status_code < 400:
                     return parse_json_payload(response.text, provider=self.provider)
 
                 info = ErrorInfo.from_body(_safe_json(response.text), provider=self.provider)
-                error = classify(response.status_code, info, provider=self.provider)
+                error = classify(
+                    response.status_code,
+                    info,
+                    provider=self.provider,
+                    retry_after=_retry_after(response.headers.get("retry-after")),
+                )
                 if not error.retryable or attempt >= self.max_retries:
                     raise error
                 last_error = error
-                if isinstance(error, RateLimitError) and error.retry_after:
+                if isinstance(error, RateLimitError) and error.retry_after is not None:
                     await asyncio.sleep(min(error.retry_after, 60.0))
                     continue
 
@@ -176,7 +193,19 @@ class HttpTransport:
         }
         url = path if path.startswith(("http://", "https://")) else f"{self.base_url}{path}"
         req = self._client.build_request("POST", url, json=dict(payload), headers=merged)
-        response = await self._client.send(req, stream=True)
+        try:
+            response = await self._client.send(req, stream=True, follow_redirects=False)
+        except httpx.TimeoutException as exc:
+            raise ProviderError(
+                f"request timed out: {exc}", retryable=True, provider=self.provider
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ProviderError(
+                f"network error: {exc}", retryable=True, provider=self.provider
+            ) from exc
+        if 300 <= response.status_code < 400:
+            await response.aclose()
+            self._reject_redirect(response)
 
         if response.status_code >= 400:
             # The body is still unreadable while streaming, so buffer it first.
@@ -185,7 +214,12 @@ class HttpTransport:
             finally:
                 await response.aclose()
             info = ErrorInfo.from_body(_safe_json(raw), provider=self.provider)
-            raise classify(response.status_code, info, provider=self.provider)
+            raise classify(
+                response.status_code,
+                info,
+                provider=self.provider,
+                retry_after=_retry_after(response.headers.get("retry-after")),
+            )
 
         return response
 
@@ -208,7 +242,8 @@ class HttpTransport:
     ) -> Any:
         merged = {**self.extra_headers, **(headers or {})}
         url = path if path.startswith(("http://", "https://")) else f"{self.base_url}{path}"
-        response = await self._client.get(url, headers=merged)
+        response = await self._client.get(url, headers=merged, follow_redirects=False)
+        self._reject_redirect(response)
         if response.status_code >= 400:
             info = ErrorInfo.from_body(_safe_json(response.text), provider=self.provider)
             raise classify(response.status_code, info, provider=self.provider)
@@ -227,6 +262,30 @@ class HttpTransport:
                 yield event
         finally:
             await response.aclose()
+
+    def _reject_redirect(self, response: httpx.Response) -> None:
+        if 300 <= response.status_code < 400:
+            raise ProviderError(
+                f"HTTP {response.status_code} redirect to {response.headers.get('location', '<none>')!r}; provider base URLs must point at the API endpoint directly",
+                status=response.status_code,
+                provider=self.provider,
+            )
+
+
+def _retry_after(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        delay = float(value)
+    except ValueError:
+        try:
+            date = parsedate_to_datetime(value)
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=UTC)
+            delay = (date - datetime.now(UTC)).total_seconds()
+        except (ValueError, TypeError, OverflowError):
+            return None
+    return max(0.0, delay) if math.isfinite(delay) else None
 
 
 def _backoff(attempt: int, *, base: float = 0.8, cap: float = 30.0) -> float:

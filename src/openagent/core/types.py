@@ -15,6 +15,7 @@ import json
 import time
 import uuid
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Literal, Self
@@ -368,6 +369,17 @@ class ToolSpec:
     params: list[ToolParam] = field(default_factory=list)
     danger: Literal["none", "write", "execute", "network"] = "none"
     source: Literal["builtin", "mcp"] = "builtin"
+    input_schema: dict[str, Any] | None = None
+
+    def schema(self) -> dict[str, Any]:
+        """Return the complete input schema without losing nested constraints."""
+        if self.input_schema is not None:
+            return deepcopy(self.input_schema)
+        return {
+            "type": "object",
+            "properties": {p.name: p.to_schema() for p in self.params},
+            "required": [p.name for p in self.params if p.required],
+        }
 
     def to_openai_schema(self) -> dict[str, Any]:
         return {
@@ -375,11 +387,7 @@ class ToolSpec:
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": {
-                    "type": "object",
-                    "properties": {p.name: p.to_schema() for p in self.params},
-                    "required": [p.name for p in self.params if p.required],
-                },
+                "parameters": self.schema(),
             },
         }
 
@@ -387,29 +395,21 @@ class ToolSpec:
         return {
             "name": self.name,
             "description": self.description,
-            "input_schema": {
-                "type": "object",
-                "properties": {p.name: p.to_schema() for p in self.params},
-                "required": [p.name for p in self.params if p.required],
-            },
+            "input_schema": self.schema(),
         }
 
     def to_gemini_schema(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "description": self.description,
-            "parameters": {
-                "type": "object",
-                "properties": {p.name: p.to_schema() for p in self.params},
-                "required": [p.name for p in self.params if p.required],
-            },
+            "parametersJsonSchema"
+            if self.input_schema is not None
+            else "parameters": self.schema(),
         }
 
     def signature(self) -> str:
         """Compact signature used by the text tool protocol."""
-        args = ", ".join(
-            f"{p.name}{'' if p.required else '?'}: {p.type}" for p in self.params
-        )
+        args = ", ".join(f"{p.name}{'' if p.required else '?'}: {p.type}" for p in self.params)
         return f"{self.name}({args})"
 
 
@@ -551,6 +551,8 @@ class Permission(StrEnum):
 
 def iter_text_chunks(parts: Iterable[ContentPart], *, chunk_size: int = 4000) -> Iterator[str]:
     """Split text into bounded chunks, never splitting a ``\\n\\n`` paragraph."""
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
     buffer = ""
     for part in parts:
         if not isinstance(part, TextPart):

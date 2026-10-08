@@ -257,3 +257,7 @@ usage_in   = "result.usage.prompt_tokens"
 - [x] Phase 8 — MCP 클라이언트 (stdio/HTTP)
 - [x] Phase 9 — Anthropic/Gemini/Azure/Ollama/커스텀 어댑터
 - [ ] Phase 10 — 서브에이전트, 권한 고도화, 관측성
+
+## Implementation status (2026-10-08)
+
+Azure and Bedrock native transports remain planned. Their preset identifiers reject explicitly; they never fall through to an unrelated provider. Current native adapters are Anthropic, Gemini, and Ollama. See README.md and SECURITY.md for current permission, workspace, session and transport guarantees.
