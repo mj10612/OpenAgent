@@ -390,6 +390,18 @@ async def test_fs_directory_and_search_tools(sandbox_env: tuple[Path, dict[str, 
     assert "no matches" in res_grep_empty.output.lower()
 
 
+@pytest.mark.asyncio
+async def test_grep_search_rejects_blank_query(tmp_path: Path) -> None:
+    (tmp_path / "sample.txt").write_text("first\nsecond\n", encoding="utf-8")
+    tool = GrepSearchTool(tmp_path)
+    assert tool.params[0].to_schema()["minLength"] == 1
+    for query in ("", "   "):
+        result = await tool.execute(query=query)
+        assert result.is_error
+        assert "empty" in result.output.lower()
+        assert "first" not in result.output
+
+
 # =========================================================================== #
 # 4. Shell execution tests
 # =========================================================================== #

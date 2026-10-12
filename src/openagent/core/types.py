@@ -341,6 +341,7 @@ class ToolParam:
     enum: list[Any] | None = None
     default: Any = None
     items: dict[str, Any] | None = None
+    min_length: int | None = None
 
     def to_schema(self) -> dict[str, Any]:
         schema: dict[str, Any] = {"type": self.type}
@@ -350,6 +351,8 @@ class ToolParam:
             schema["enum"] = list(self.enum)
         if self.items:
             schema["items"] = self.items
+        if self.min_length is not None:
+            schema["minLength"] = self.min_length
         if self.default is not None:
             schema["default"] = self.default
         return schema

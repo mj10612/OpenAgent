@@ -489,6 +489,7 @@ class GrepSearchTool(BaseFSTool):
                 name="query",
                 type="string",
                 description="Text or pattern to search for",
+                min_length=1,
             ),
             ToolParam(
                 name="path",
@@ -509,6 +510,8 @@ class GrepSearchTool(BaseFSTool):
     async def execute(self, **kwargs: Any) -> ToolResult:
         call_id = str(kwargs.get("call_id", ""))
         query = str(kwargs.get("query", ""))
+        if not query.strip():
+            return ToolResult(call_id=call_id, output="Query must not be empty.", is_error=True)
         path = str(kwargs.get("path", "."))
         case_sensitive = bool(kwargs.get("case_sensitive", True))
 
