@@ -232,16 +232,58 @@ def test_windows_oem_output_fallback(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_web_redirect_private_target_rejected_before_second_request(monkeypatch):
-    monkeypatch.setattr("socket.getaddrinfo", lambda *args, **kwargs: [(2, 1, 6, "", ("93.184.216.34", 443))])
-    response = httpx.Response(302, headers={"location": "http://127.0.0.1/secret"}, stream=httpx.ByteStream(b""))
+    from openagent.tools.agent_tools import _public_address
+
+    async def address(url):
+        if url.host == "example.com":
+            return "93.184.216.34"
+        return await _public_address(url)
+
+    response = httpx.Response(302, headers={"location": "https://127.0.0.1/secret"}, stream=httpx.ByteStream(b""))
     send = AsyncMock(return_value=response)
-    with patch.object(httpx.AsyncClient, "send", send):
+    with patch.object(httpx.AsyncClient, "send", send), patch(
+        "openagent.tools.agent_tools._public_address", address
+    ):
         result = await WebFetchTool().execute(url="https://example.com")
     assert result.is_error and "Private" in result.output
     assert send.await_count == 1
     request = send.call_args.args[0]
     assert request.url.host == "93.184.216.34" and request.headers["host"] == "example.com"
     assert request.extensions["sni_hostname"] == "example.com"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url,location,error",
+    [
+        ("http://8.8.8.8", "http://8.8.8.8:22/", "standard HTTP(S) ports"),
+        ("https://8.8.8.8", "http://8.8.8.8/", "HTTPS redirects"),
+    ],
+)
+async def test_web_redirect_rejects_unsafe_target_before_second_request(url, location, error):
+    response = httpx.Response(302, headers={"location": location}, stream=httpx.ByteStream(b""))
+    send = AsyncMock(return_value=response)
+    with patch.object(httpx.AsyncClient, "send", send):
+        result = await WebFetchTool().execute(url=url)
+    assert result.is_error and error in result.output
+    assert send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_closes_original_streamed_response():
+    response = httpx.Response(200, stream=httpx.ByteStream(b"ok"))
+    async def chunks():
+        yield b"ok"
+
+    response.aiter_raw = chunks
+    response.aclose = AsyncMock()
+    with patch.object(httpx.AsyncClient, "send", AsyncMock(return_value=response)), patch(
+        "openagent.tools.agent_tools._public_address",
+        AsyncMock(return_value="93.184.216.34"),
+    ):
+        result = await WebFetchTool().execute(url="https://example.com")
+    assert not result.is_error and result.output == "ok"
+    response.aclose.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -253,11 +253,15 @@ class WebFetchTool(Tool):
                     pinned = current.copy_with(host=address)
                     request = client.build_request("GET", pinned, headers=request_headers, extensions={"sni_hostname": current.host})
                     response = await client.send(request, stream=True)
+                    streamed_response = response
                     try:
                         if response.status_code in (301, 302, 303, 307, 308):
                             if redirect == 5 or "location" not in response.headers:
                                 raise ValueError("Redirect limit exceeded or missing Location")
-                            current = current.join(str(response.headers["location"]))
+                            target = current.join(str(response.headers["location"]))
+                            if current.scheme == "https" and target.scheme != "https":
+                                raise ValueError("HTTPS redirects must remain HTTPS")
+                            current = target
                             continue
                         if response.headers.get("content-encoding", "identity").lower() not in ("", "identity"):
                             raise ValueError("Compressed responses are not supported")
@@ -272,7 +276,7 @@ class WebFetchTool(Tool):
                         response = httpx.Response(response.status_code, headers=response.headers, content=bytes(body), request=request)
                         break
                     finally:
-                        await response.aclose()
+                        await streamed_response.aclose()
         except httpx.TimeoutException:
             return ToolResult(
                 call_id=call_id,
@@ -311,12 +315,15 @@ async def _public_address(url: httpx.URL) -> str:
     """Resolve only HTTP(S) URLs whose every address is globally routable."""
     if url.scheme not in ("http", "https") or not url.host or url.username or url.password:
         raise ValueError("Only public HTTP(S) URLs without credentials are permitted")
+    expected_port = 443 if url.scheme == "https" else 80
+    if url.port not in (None, expected_port):
+        raise ValueError("Only standard HTTP(S) ports are permitted")
     if url.host.lower().rstrip(".") == "localhost":
         raise ValueError("Private hosts are not permitted")
     try:
         addresses = [str(ipaddress.ip_address(url.host))]
     except ValueError:
-        records = await asyncio.to_thread(socket.getaddrinfo, url.host, url.port or (443 if url.scheme == "https" else 80), type=socket.SOCK_STREAM)
+        records = await asyncio.to_thread(socket.getaddrinfo, url.host, expected_port, type=socket.SOCK_STREAM)
         addresses = list(dict.fromkeys(str(record[4][0]) for record in records))
     if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
         raise ValueError("Private, loopback, link-local, or reserved hosts are not permitted")
