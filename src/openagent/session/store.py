@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import re
+import sys
 import time
 import uuid
 from collections.abc import Mapping, Sequence
@@ -90,7 +91,7 @@ class SessionStore:
                 handle.write(b"0")
                 handle.flush()
             handle.seek(0)
-            if os.name == "nt":
+            if sys.platform == "win32":
                 import msvcrt
                 deadline = time.monotonic() + 30
                 while True:
@@ -108,7 +109,7 @@ class SessionStore:
                 yield
             finally:
                 handle.seek(0)
-                if os.name == "nt":
+                if sys.platform == "win32":
                     msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
                 else:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
