@@ -71,6 +71,8 @@ class ToolResultPart:
     name: str
     content: str
     is_error: bool = False
+    structured_data: Any = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     type: Literal["tool_result"] = "tool_result"
 
@@ -117,7 +119,7 @@ class ToolCall:
     raw_arguments: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {"id": self.id, "name": self.name, "arguments": dict(self.arguments)}
+        return {"id": self.id, "name": self.name, "arguments": deepcopy(self.arguments), "raw_arguments": self.raw_arguments}
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> Self:
@@ -132,7 +134,7 @@ class ToolCall:
                 parsed = {"value": parsed}
         elif isinstance(args, Mapping):
             raw = json.dumps(dict(args))
-            parsed = dict(args)
+            parsed = deepcopy(dict(args))
         else:
             raw, parsed = "", {}
 
@@ -140,7 +142,7 @@ class ToolCall:
             name=str(data.get("name", "")),
             arguments=parsed,
             id=str(data.get("id") or f"call_{uuid.uuid4().hex[:24]}"),
-            raw_arguments=raw,
+            raw_arguments=str(data.get("raw_arguments", raw)),
         )
 
 
@@ -206,13 +208,15 @@ class Message:
         content: str,
         *,
         is_error: bool = False,
+        structured_data: Any = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> Message:
         return cls(
             role="tool",
             content=[TextPart(content)],
             tool_call_id=call_id,
             name=name,
-            metadata={"is_error": is_error},
+            metadata={**deepcopy(dict(metadata or {})), "is_error": is_error, **({"structured_data": deepcopy(structured_data)} if structured_data is not None else {})},
         )
 
     # -- accessors --------------------------------------------------------- #
@@ -250,7 +254,7 @@ class Message:
         if self.reasoning:
             data["reasoning"] = self.reasoning
         if self.metadata:
-            data["metadata"] = self.metadata
+            data["metadata"] = deepcopy(self.metadata)
         return data
 
     @classmethod
@@ -276,7 +280,7 @@ class Message:
             name=data.get("name"),
             reasoning=data.get("reasoning"),
             created_at=float(data.get("created_at", time.time())),
-            metadata=dict(data.get("metadata") or {}),
+            metadata=deepcopy(dict(data.get("metadata") or {})),
         )
 
 
@@ -288,13 +292,15 @@ def part_to_dict(part: ContentPart) -> dict[str, Any]:
             return {"type": "thinking", "text": t, "signature": s}
         case ImagePart(data=d, mime_type=m, url=u, detail=det):
             return {"type": "image", "data": d, "mime_type": m, "url": u, "detail": det}
-        case ToolResultPart(call_id=c, name=n, content=ct, is_error=e):
+        case ToolResultPart(call_id=c, name=n, content=ct, is_error=e, structured_data=s, metadata=m):
             return {
                 "type": "tool_result",
                 "call_id": c,
                 "name": n,
                 "content": ct,
                 "is_error": e,
+                "structured_data": deepcopy(s),
+                "metadata": deepcopy(m),
             }
     raise TypeError(f"unsupported content part: {type(part)!r}")
 
@@ -316,6 +322,8 @@ def part_from_dict(data: Mapping[str, Any]) -> ContentPart:
             name=str(data.get("name", "")),
             content=str(data.get("content", "")),
             is_error=bool(data.get("is_error")),
+            structured_data=deepcopy(data.get("structured_data")),
+            metadata=deepcopy(dict(data.get("metadata") or {})),
         )
     return TextPart(text=str(data.get("text", "")))
 

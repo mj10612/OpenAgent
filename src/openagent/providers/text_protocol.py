@@ -34,8 +34,9 @@ import re
 from collections.abc import Iterator, Mapping
 from typing import Any
 
-from ..core.provider import coerce_arguments
+from ..core.provider import ToolCallParseError
 from ..core.types import ChatRequest, ToolCall, ToolSpec
+from ..utils.tool_metadata import render_tool_metadata
 
 #: Fenced JSON block, the primary dialect.
 FENCED_RE = re.compile(
@@ -68,7 +69,7 @@ class TextToolCodec:
     def render(self, request: ChatRequest) -> str:
         """Build the system prompt, appending a tool contract section."""
         base = "\n\n".join(m.text for m in request.messages if m.role == "system" and m.text)
-        if not request.tools:
+        if not request.tools or request.tool_choice == "none":
             return base
 
         lines = [
@@ -107,19 +108,7 @@ class TextToolCodec:
         return "\n".join(lines)
 
     def _render_spec(self, spec: ToolSpec) -> list[str]:
-        out = [f"## {spec.signature()}", "", spec.description.strip()]
-        if spec.params:
-            out.append("")
-            for param in spec.params:
-                requirement = "required" if param.required else "optional"
-                extra = f", one of {spec_default_list(param.enum)}" if param.enum else ""
-                default = f", default {json.dumps(param.default)}" if param.default else ""
-                out.append(
-                    f"- `{param.name}` ({param.type}, {requirement}{extra}{default}): "
-                    f"{param.description.strip()}"
-                )
-        out.append("")
-        return out
+        return [render_tool_metadata(spec), ""]
 
     # -- response parsing --------------------------------------------------- #
 
@@ -201,8 +190,8 @@ class _StreamingParser:
                     continue
                 break
 
-            if force and FENCED_RE.search(remainder):
-                continue  # unterminated fence at EOF; drop it
+            if force and re.search(r"```(?:tool_code|tool_use|tool|json_tool)\b", remainder, re.I):
+                raise ToolCallParseError("unterminated tool block")
             break
 
         return calls, remainder
@@ -264,28 +253,44 @@ class _StreamingParser:
             arg_text = "\n".join(lines[1:]).strip()
             arguments: dict[str, Any] = {}
             if arg_text:
-                try:
-                    arguments = coerce_arguments(arg_text)
-                except Exception:
-                    arguments = {}
+                arguments = _strict_arguments(arg_text)
             calls.append(
-                ToolCall(name=name, arguments=arguments, id=_next_call_id(), raw_arguments=arg_text or "{}")
+                ToolCall(
+                    name=name,
+                    arguments=arguments,
+                    id=_next_call_id(),
+                    raw_arguments=arg_text or "{}",
+                )
             )
 
+        if stripped and not calls:
+            raise ToolCallParseError("invalid tool block")
         return calls
+
+
+def _strict_arguments(raw: str) -> dict[str, Any]:
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ToolCallParseError(f"could not decode tool arguments: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ToolCallParseError("tool arguments must be a JSON object")
+    return value
 
 
 def _call_from_obj(entry: Any) -> ToolCall | None:
     """Build a :class:`ToolCall` from a decoded JSON object."""
     if not isinstance(entry, Mapping):
-        return None
+        raise ToolCallParseError("tool call must be an object")
 
     # Accept several key spellings; models are inconsistent here.
     name = entry.get("name") or entry.get("tool") or entry.get("function") or entry.get("tool_name")
-    if not name:
-        return None
+    if not isinstance(name, str) or not name:
+        raise ToolCallParseError("tool call requires a name")
 
-    raw_args = entry.get("arguments", entry.get("args", entry.get("input", entry.get("parameters"))))
+    raw_args = entry.get(
+        "arguments", entry.get("args", entry.get("input", entry.get("parameters")))
+    )
     arguments: dict[str, Any] = {}
     raw = "{}"
     if isinstance(raw_args, Mapping):
@@ -293,10 +298,10 @@ def _call_from_obj(entry: Any) -> ToolCall | None:
         raw = json.dumps(arguments)
     elif isinstance(raw_args, str):
         raw = raw_args
-        try:
-            arguments = coerce_arguments(raw_args)
-        except Exception:
-            arguments = {}
+        arguments = _strict_arguments(raw_args)
+
+    elif any(key in entry for key in ("arguments", "args", "input", "parameters")):
+        raise ToolCallParseError("tool arguments must be a JSON object")
 
     call_id = entry.get("id") or entry.get("call_id") or _next_call_id()
     return ToolCall(name=str(name), arguments=arguments, id=str(call_id), raw_arguments=raw)

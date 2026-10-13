@@ -40,6 +40,7 @@ from ..core.provider import (
     coerce_arguments,
     content_to_plain,
     render_system_prompt,
+    render_tool_arguments,
 )
 from ..core.types import (
     ChatRequest,
@@ -195,7 +196,7 @@ class OpenAICompatProvider(ChatProvider):
                         {
                             "id": c.id,
                             "type": "function",
-                            "function": {"name": c.name, "arguments": c.raw_arguments or "{}"},
+                            "function": {"name": c.name, "arguments": render_tool_arguments(c)},
                         }
                         for c in msg.tool_calls
                     ]
@@ -236,7 +237,19 @@ class OpenAICompatProvider(ChatProvider):
 
     def build_payload(self, request: ChatRequest, *, stream: bool) -> dict[str, Any]:
         """Assemble the JSON body for a completion request."""
-        use_text_protocol = bool(request.tools) and self.tool_protocol == ToolProtocol.TEXT
+        if (
+            request.tools
+            and request.tool_choice == "required"
+            and self.tool_protocol == ToolProtocol.TEXT
+        ):
+            raise ProviderError(
+                "TEXT protocol does not support required tool choice", provider=self.name
+            )
+        use_text_protocol = (
+            bool(request.tools)
+            and request.tool_choice != "none"
+            and self.tool_protocol == ToolProtocol.TEXT
+        )
 
         if use_text_protocol:
             system = self._codec.render(request)
@@ -278,7 +291,7 @@ class OpenAICompatProvider(ChatProvider):
         if request.stop:
             payload["stop"] = request.stop
 
-        if request.tools and not use_text_protocol:
+        if request.tools and request.tool_choice != "none" and not use_text_protocol:
             payload["tools"] = [spec.to_openai_schema() for spec in request.tools]
             payload["tool_choice"] = request.tool_choice
 
@@ -289,20 +302,27 @@ class OpenAICompatProvider(ChatProvider):
             payload["reasoning_effort"] = request.thinking.effort or "medium"
 
         payload.update(self.extra_body)
+        if request.tool_choice == "none":
+            payload.pop("tools", None)
+            payload.pop("tool_choice", None)
         return payload
 
     # -- streaming ---------------------------------------------------------- #
 
     async def stream(self, request: ChatRequest) -> AsyncIterator[StreamEvent]:
-        payload = self.build_payload(request, stream=True)
         try:
+            payload = self.build_payload(request, stream=True)
             response = await self._transport.stream_post("/chat/completions", payload)
         except ProviderError as exc:
             yield ErrorEvent(error=exc)
             return
 
         try:
-            use_text_protocol = bool(request.tools) and self.tool_protocol == ToolProtocol.TEXT
+            use_text_protocol = (
+                bool(request.tools)
+                and request.tool_choice != "none"
+                and self.tool_protocol == ToolProtocol.TEXT
+            )
 
             yield StartEvent(model=request.model, provider=self.name)
 
@@ -310,6 +330,7 @@ class OpenAICompatProvider(ChatProvider):
             reasoning_parts: list[str] = []
             usage = Usage()
             finish_reason = "stop"
+            terminal_received = False
             text_protocol_calls: list[ToolCall] = []
 
             # Partial tool calls keyed by streaming index.
@@ -321,6 +342,7 @@ class OpenAICompatProvider(ChatProvider):
                     if event.event not in ("message", ""):
                         continue
                     if event.data.strip() == "[DONE]":
+                        terminal_received = True
                         break
                     try:
                         chunk = json.loads(event.data)
@@ -333,6 +355,7 @@ class OpenAICompatProvider(ChatProvider):
                     for choice in chunk.get("choices") or ():
                         if reason := choice.get("finish_reason"):
                             finish_reason = reason
+                            terminal_received = True
                         delta = choice.get("delta") or choice.get("message") or {}
 
                         if reasoning_text := delta.get("reasoning_content") or delta.get(
@@ -354,6 +377,10 @@ class OpenAICompatProvider(ChatProvider):
                                 text_parts.append(content)
                                 yield TextDelta(text=content)
 
+                        if request.tool_choice == "none" and delta.get("tool_calls"):
+                            raise ProviderError(
+                                "provider returned forbidden tool calls", provider=self.name
+                            )
                         for raw_call in delta.get("tool_calls") or ():
                             index = int(raw_call.get("index", len(partials)))
                             slot = partials.setdefault(index, {"id": "", "name": "", "args": ""})
@@ -370,6 +397,9 @@ class OpenAICompatProvider(ChatProvider):
                                 if args_delta := fn.get("arguments"):
                                     slot["args"] += args_delta
                                     yield ToolCallDelta(index=index, arguments_delta=args_delta)
+
+                if not terminal_received:
+                    raise ProviderError("stream ended before completion marker", provider=self.name)
 
                 if codec_stream is not None:
                     text_protocol_calls, remaining_text = codec_stream.finish()
@@ -438,9 +468,7 @@ class OpenAICompatProvider(ChatProvider):
                 ModelInfo(
                     id=model_id,
                     provider=self.name,
-                    context_window=entry.get("context_length")
-                    or entry.get("context_window")
-                    or guess_context_window(model_id),
+                    context_window=entry.get("context_length") or entry.get("context_window"),
                     max_output=entry.get("max_output_tokens"),
                     supports_tools=entry.get("tool_calling"),
                     supports_vision=entry.get("vision"),

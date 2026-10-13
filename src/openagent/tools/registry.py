@@ -15,7 +15,7 @@ from typing import Any
 from jsonschema import Draft202012Validator
 
 from openagent.core.types import ToolCall, ToolSpec
-from openagent.tools.base import Tool, ToolResult
+from openagent.tools.base import Tool, ToolResult, bounded_output
 
 
 class PermissionAction(StrEnum):
@@ -45,6 +45,7 @@ class ToolRegistry:
         danger_policies: dict[str, PermissionAction] | None = None,
         *,
         max_concurrent_tools: int = 8,
+        checkpoint_enabled: bool = True,
     ) -> None:
         self._tools: dict[str, Tool] = {}
         self._danger_policies: dict[str, PermissionAction] = dict(DEFAULT_DANGER_POLICIES)
@@ -53,6 +54,8 @@ class ToolRegistry:
         self._tool_policies: dict[str, PermissionAction] = {}
         self._mutation_lock = asyncio.Lock()
         self._confirmation_lock = asyncio.Lock()
+        from openagent.tools.changes import ChangeTracker
+        self.changes = ChangeTracker(checkpoint_enabled)
         if max_concurrent_tools < 1:
             raise ValueError("max_concurrent_tools must be positive")
         self.max_concurrent_tools = max_concurrent_tools
@@ -173,12 +176,18 @@ class ToolRegistry:
 
         kwargs: dict[str, Any] = dict(call.arguments)
         try:
-            sig = inspect.signature(tool.execute)
-            if "call_id" in sig.parameters or any(
-                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-            ):
-                kwargs["call_id"] = call.id
-            res = await tool.execute(**kwargs)
+            before = self.changes.capture(tool, kwargs)
+            execute_arguments = getattr(tool, "execute_arguments", None)
+            if execute_arguments is not None:
+                res = await execute_arguments(kwargs, call.id)
+            else:
+                sig = inspect.signature(tool.execute)
+                if "call_id" in sig.parameters or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                ):
+                    kwargs["call_id"] = call.id
+                res = await tool.execute(**kwargs)
+            self.changes.record(tool, before)
             if not isinstance(res, ToolResult):
                 raise TypeError(f"Expected ToolResult, got {type(res).__name__}")
             if not isinstance(res.output, str):
@@ -190,8 +199,11 @@ class ToolRegistry:
                 is_error=True,
             )
 
-        if not res.call_id:
-            return ToolResult(call_id=call.id, output=res.output, is_error=res.is_error)
+        res.call_id = call.id
+        limited = bounded_output(res.output)
+        if limited != res.output:
+            res.metadata["truncated"] = True
+        res.output = limited
         return res
 
     async def execute_parallel(

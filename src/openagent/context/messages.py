@@ -10,6 +10,7 @@ Licensed under the Apache License, Version 2.0.
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Sequence
+from copy import deepcopy
 from typing import Any
 
 from openagent.context.estimator import TokenEstimator
@@ -261,7 +262,7 @@ class MessageManager:
     def copy(self) -> MessageManager:
         """Create a deep copy of this MessageManager."""
         return MessageManager(
-            messages=[Message.from_dict(m.to_dict()) for m in self._messages],
+            messages=deepcopy(self._messages),
             estimator=self.estimator,
         )
 

@@ -34,6 +34,11 @@ class BytesStream(httpx.AsyncByteStream):
 
 
 def response(chunks, sse=True):
+    chunks = list(chunks)
+    if sse and any(c.get("type", "").startswith("content_block") for c in chunks):
+        chunks.append({"type": "message_stop"})
+    elif sse and any("choices" in c for c in chunks):
+        chunks.append({"choices": [{"finish_reason": "stop", "delta": {}}]})
     body = "".join(
         "data: " + json.dumps(c) + "\n\n" if sse else json.dumps(c) + "\n" for c in chunks
     )

@@ -285,7 +285,21 @@ class WebFetchTool(Tool):
                             downloaded += len(chunk)
                             if downloaded > cap:
                                 raise ValueError("Response exceeds 2 MB download limit")
-                            decoded = decoder.decompress(chunk, cap - len(body) + 1) if decoder else chunk
+                            if decoder:
+                                pending = chunk
+                                while pending:
+                                    if decoder.eof:
+                                        if encoding != "gzip":
+                                            raise ValueError("Trailing compressed data")
+                                        decoder = zlib.decompressobj(31)
+                                    decoded = decoder.decompress(pending, cap - len(body) + 1)
+                                    if len(body) + len(decoded) > cap or decoder.unconsumed_tail:
+                                        raise ValueError("Response exceeds 2 MB decompressed limit")
+                                    body.extend(decoded)
+                                    pending = decoder.unused_data
+                                decoded = b""
+                            else:
+                                decoded = chunk
                             if brotli_decoder:
                                 decoded = brotli_decoder.process(chunk, output_buffer_limit=cap - len(body) + 1)
                                 if not brotli_decoder.can_accept_more_data():

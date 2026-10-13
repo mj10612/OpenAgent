@@ -13,9 +13,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
-from typing import Any
-
-import httpx
+from typing import Any, Protocol
 
 from ..core.provider import ProviderError
 
@@ -105,7 +103,11 @@ def decode_sse_lines(lines: Iterator[str]) -> Iterator[SSEvent]:
         yield trailing
 
 
-async def iter_sse(response: httpx.Response) -> AsyncIterator[SSEvent]:
+class LineResponse(Protocol):
+    def aiter_lines(self) -> AsyncIterator[str]: ...
+
+
+async def iter_sse(response: LineResponse) -> AsyncIterator[SSEvent]:
     """Decode an open streaming HTTP response into events.
 
     ``response.aiter_lines`` is used rather than ``iter_bytes`` so the framing
@@ -171,12 +173,7 @@ class ErrorInfo:
             return cls(message=err, raw=body)
         if isinstance(err, dict):
             return cls(
-                message=str(
-                    err.get("message")
-                    or err.get("detail")
-                    or err.get("status")
-                    or err
-                ),
+                message=str(err.get("message") or err.get("detail") or err.get("status") or err),
                 type=str(err.get("type", "")),
                 code=str(err.get("code", "")),
                 raw=body,

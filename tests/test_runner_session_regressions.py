@@ -196,7 +196,7 @@ async def test_generator_close_during_tool_results_restores_history():
 
 
 @pytest.mark.asyncio
-async def test_iteration_limit_persisted_before_done_close(tmp_path):
+async def test_iteration_limit_does_not_persist_success(tmp_path):
     call = ToolCall(id="a", name="f", arguments={})
     store = SessionStore(tmp_path)
     runner = AgentRunner(
@@ -205,13 +205,11 @@ async def test_iteration_limit_persisted_before_done_close(tmp_path):
         max_tool_iterations=1,
     )
     stream = runner.run_turn("go")
-    async for event in stream:
-        if isinstance(event, DoneEvent):
-            break
+    events = [event async for event in stream]
     await stream.aclose()
-    _, messages = store.load_session(runner.session_id)
-    assert messages[-1].text == "Reached maximum tool call iterations without concluding."
-    assert messages[-1].role == "assistant"
+    assert isinstance(events[-1], ErrorEvent)
+    assert runner.session_id is None
+    assert store.list_sessions() == []
 
 
 @pytest.mark.asyncio

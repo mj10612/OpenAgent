@@ -17,7 +17,7 @@ from html import escape
 from openagent.context.estimator import TokenEstimator
 from openagent.context.messages import MessageManager
 from openagent.core.provider import ChatProvider
-from openagent.core.types import ChatRequest, Message, Role, TextPart
+from openagent.core.types import ChatRequest, Message, Role, TextPart, Usage
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,7 @@ class Compactor:
         self.default_model = default_model
         self.keep_recent_groups = keep_recent_groups
         self.summary_role = summary_role
+        self.usage = Usage()
 
     def extract_heuristic_summary(self, messages: Sequence[Message]) -> str:
         """Extract a structured summary from message history without LLM calls.
@@ -125,6 +126,7 @@ class Compactor:
         provider: ChatProvider,
         *,
         model: str | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         """Call LLM provider to summarize history into structured bullet points."""
         transcript_lines: list[str] = []
@@ -176,7 +178,12 @@ class Compactor:
             max_tokens=800,
             temperature=0.2,
         )
+        context_window = getattr(provider, "context_window", None) or getattr(provider, "default_context_window", 128_000) or 128_000
+        request.max_tokens = min(800, max(1, context_window // 4), max_tokens or 800, getattr(provider, "default_max_tokens", None) or 800)
+        if self.estimator.estimate_request(request) + request.max_tokens > context_window:
+            return self.extract_heuristic_summary(messages)
         response = await provider.complete(request)
+        self.usage = self.usage + response.usage
         summary_text = response.message.text.strip()
         if not summary_text:
             raise ValueError("Provider returned empty summary")
@@ -274,7 +281,7 @@ class Compactor:
 
         if provider is not None:
             try:
-                summary_text = await self.extract_llm_summary(older, provider)
+                summary_text = await self.extract_llm_summary(older, provider, max_tokens=max(1, max_tokens // 4))
             except Exception as e:
                 logger.warning("LLM summarization failed, falling back to heuristic: %s", e)
                 return self.compact_heuristic(messages, max_tokens, estimator=est)

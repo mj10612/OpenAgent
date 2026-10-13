@@ -8,8 +8,8 @@ Licensed under the Apache License, Version 2.0.
 
 from __future__ import annotations
 
-import contextlib
 import json
+import math
 import os
 import tempfile
 import tomllib
@@ -25,21 +25,46 @@ from openagent.tools.registry import DEFAULT_DANGER_POLICIES, PermissionAction
 def _normalize_danger_policy(val: Mapping[str, Any] | None) -> dict[str, PermissionAction]:
     """Normalize a danger policy dictionary to PermissionAction enums."""
     policy: dict[str, PermissionAction] = {}
-    if not val:
+    if val is None:
         return policy
+    if not isinstance(val, Mapping):
+        raise ValueError('policy must be a table of tool/level names and allow/ask/deny actions')
     for k, v in val.items():
-        if isinstance(v, PermissionAction):
-            policy[str(k)] = v
-        elif isinstance(v, str):
-            with contextlib.suppress(ValueError):
-                policy[str(k)] = PermissionAction(v.lower().strip())
+        if not isinstance(k, str) or not k.strip() or any(c in k for c in '*?'):
+            raise ValueError('policy names must be nonempty exact names')
+        try:
+            policy[k] = PermissionAction(v.lower().strip()) if isinstance(v, str) else PermissionAction(v)
+        except (ValueError, TypeError):
+            raise ValueError(f'Invalid policy action for {k}: expected allow, ask or deny') from None
     return policy
 
 
 def _parse_mcp_servers(val: Any) -> list[MCPServerConfig]:
     """Parse MCP servers from list of tables or dict of tables."""
-    if not val:
+    if val is None:
         return []
+    if not isinstance(val, (list, Mapping)):
+        raise ValueError('mcp_servers must be an array or table of server configurations')
+    items = val if isinstance(val, list) else list(val.values())
+    for item in items:
+        if not isinstance(item, (MCPServerConfig, Mapping)):
+            raise ValueError('mcp_servers entries must be tables')
+        if isinstance(item, Mapping):
+            unknown = set(item) - set(MCPServerConfig.__dataclass_fields__)
+            if unknown:
+                raise ValueError('Unknown MCP server configuration key')
+            for key in ('timeout', 'read_timeout'):
+                value = item.get(key)
+                if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or value <= 0):
+                    raise ValueError(f'mcp_servers.{key} must be a finite positive number')
+            for key in ('name', 'command', 'url', 'transport', 'cwd'):
+                if key in item and not isinstance(item[key], (str, Path)):
+                    raise ValueError(f'mcp_servers.{key} must be a string')
+            if 'args' in item and (not isinstance(item['args'], list) or any(not isinstance(value, str) for value in item['args'])):
+                raise ValueError('mcp_servers.args must be an array of strings')
+            for key in ('headers', 'env'):
+                if key in item and (not isinstance(item[key], Mapping) or any(not isinstance(value, str) for value in item[key].values())):
+                    raise ValueError(f'mcp_servers.{key} must be a table of strings')
     servers: list[MCPServerConfig] = []
     if isinstance(val, list):
         for item in val:
@@ -68,11 +93,22 @@ class CustomProviderConfig:
     chat_endpoint: str = "/chat/completions"
     auth_scheme: str = "bearer"
     auth_header: str = "authorization"
+    usage_mode: str = "delta"
+
+    def __post_init__(self) -> None:
+        if self.usage_mode not in {'delta', 'cumulative', 'final'}:
+            raise ValueError('custom_provider.usage_mode must be delta, cumulative or final')
+        if self.auth_scheme not in {'bearer', 'api_key', 'none'}:
+            raise ValueError('Invalid custom_provider.auth_scheme')
+        for key, value in asdict(self).items():
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f'custom_provider.{key} must be a string')
 
     def provider_kwargs(self) -> dict[str, Any]:
         if self.auth_scheme not in {"bearer", "api_key", "none"}:
             raise ValueError(f"Unsupported custom auth scheme: {self.auth_scheme}")
         return {
+            "usage_mode": self.usage_mode,
             "text_path": self.jsonpath_text,
             "thinking_path": self.jsonpath_thinking,
             "tool_calls_path": self.jsonpath_tool_calls,
@@ -101,13 +137,41 @@ class OpenAgentConfig:
         default_factory=lambda: dict(DEFAULT_DANGER_POLICIES)
     )
     mcp_servers: list[MCPServerConfig] = field(default_factory=list)
+    tool_policy: dict[str, PermissionAction] = field(default_factory=dict)
     workspace: Path = field(default_factory=lambda: Path.cwd().resolve())
     extra_instructions: list[str] = field(default_factory=list)
     auto_approve: bool = False
+    checkpoint_enabled: bool = True
     session_id: str | None = None
     config_path: Path | None = None
 
     def __post_init__(self) -> None:
+        for key in ('auto_approve', 'checkpoint_enabled'):
+            if type(getattr(self, key)) is not bool:
+                raise ValueError(f'{key} must be a boolean')
+        for key in ('max_tool_iterations', 'max_tokens', 'context_window'):
+            value = getattr(self, key)
+            if value is not None and (type(value) is not int or value <= 0):
+                raise ValueError(f'{key} must be a positive integer')
+        for key, upper in (('temperature', 2), ('top_p', 1)):
+            value = getattr(self, key)
+            if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= upper):
+                raise ValueError(f'{key} must be finite and between 0 and {upper}')
+        for key in ('model', 'api_key', 'base_url', 'session_id'):
+            value = getattr(self, key)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f'{key} must be a string')
+        if not self.model.strip():
+            raise ValueError('model must be nonempty')
+        self.tool_policy = _normalize_danger_policy(self.tool_policy)
+        self.danger_policy = _normalize_danger_policy(self.danger_policy)
+        if set(self.danger_policy) - set(DEFAULT_DANGER_POLICIES):
+            raise ValueError('Unknown danger_policy level')
+        for server in self.mcp_servers:
+            for key in ('timeout', 'read_timeout'):
+                value = getattr(server, key)
+                if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or value <= 0):
+                    raise ValueError(f'mcp_servers.{server.name}.{key} must be finite and positive')
         if isinstance(self.workspace, str):
             self.workspace = Path(self.workspace).resolve()
         else:
@@ -169,7 +233,11 @@ def _parse_toml_file(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {}
     with open(path, "rb") as f:
-        return tomllib.load(f)
+        data = tomllib.load(f)
+    unknown = set(data) - (set(OpenAgentConfig.__dataclass_fields__) - {'config_path'})
+    if unknown:
+        raise ValueError(f'{path}: unknown configuration keys: {", ".join(sorted(unknown))}')
+    return data
 
 
 def _apply_dict_to_config(
@@ -186,6 +254,7 @@ def _apply_dict_to_config(
         "context_window",
         "max_tool_iterations",
         "auto_approve",
+        "checkpoint_enabled",
         "session_id",
     ]
     for key in scalar_keys:
@@ -198,10 +267,11 @@ def _apply_dict_to_config(
             raw if raw.is_absolute() else (base_dir or Path.cwd()) / raw
         ).resolve()
 
-    if "danger_policy" in config_dict and isinstance(config_dict["danger_policy"], Mapping):
-        current_policy = dict(current.get("danger_policy", {}))
-        current_policy.update(_normalize_danger_policy(config_dict["danger_policy"]))
-        current["danger_policy"] = current_policy
+    for key in ('danger_policy', 'tool_policy'):
+        if key in config_dict:
+            current_policy = dict(current.get(key, {}))
+            current_policy.update(_normalize_danger_policy(config_dict[key]))
+            current[key] = current_policy
 
     if "mcp_servers" in config_dict:
         current["mcp_servers"] = _parse_mcp_servers(config_dict["mcp_servers"])
@@ -223,7 +293,11 @@ def _apply_dict_to_config(
         if isinstance(val, str):
             current["extra_instructions"] = [val]
         elif isinstance(val, list):
-            current["extra_instructions"] = [str(x) for x in val]
+            if any(not isinstance(x, str) for x in val):
+                raise ValueError('extra_instructions must contain strings')
+            current["extra_instructions"] = val
+        else:
+            raise ValueError('extra_instructions must be a string or array of strings')
 
 
 def load_config(
@@ -251,10 +325,12 @@ def load_config(
         "custom_provider": None,
         "max_tool_iterations": 25,
         "danger_policy": dict(DEFAULT_DANGER_POLICIES),
+        "tool_policy": {},
         "mcp_servers": [],
         "workspace": Path.cwd().resolve(),
         "extra_instructions": [],
         "auto_approve": False,
+        "checkpoint_enabled": True,
         "session_id": None,
         "config_path": None,
     }
@@ -290,27 +366,27 @@ def load_config(
         config_data["base_url"] = os.environ["OPENAGENT_BASE_URL"]
     if os.environ.get("OPENAGENT_API_KEY"):
         config_data["api_key"] = os.environ["OPENAGENT_API_KEY"]
-    if os.environ.get("OPENAGENT_TEMPERATURE"):
-        with contextlib.suppress(ValueError):
-            config_data["temperature"] = float(os.environ["OPENAGENT_TEMPERATURE"])
-    if os.environ.get("OPENAGENT_TOP_P"):
-        with contextlib.suppress(ValueError):
-            config_data["top_p"] = float(os.environ["OPENAGENT_TOP_P"])
-    if os.environ.get("OPENAGENT_MAX_TOKENS"):
-        with contextlib.suppress(ValueError):
-            config_data["max_tokens"] = int(os.environ["OPENAGENT_MAX_TOKENS"])
-    if os.environ.get("OPENAGENT_CONTEXT_WINDOW"):
-        with contextlib.suppress(ValueError):
-            config_data["context_window"] = int(os.environ["OPENAGENT_CONTEXT_WINDOW"])
-    if os.environ.get("OPENAGENT_MAX_TOOL_ITERATIONS"):
-        with contextlib.suppress(ValueError):
-            config_data["max_tool_iterations"] = int(os.environ["OPENAGENT_MAX_TOOL_ITERATIONS"])
+    for key, converter in (('temperature', float), ('top_p', float), ('max_tokens', int), ('context_window', int), ('max_tool_iterations', int)):
+        env_key = f'OPENAGENT_{key.upper()}'
+        if env_key in os.environ:
+            try:
+                config_data[key] = converter(os.environ[env_key])
+            except ValueError:
+                raise ValueError(f'{env_key}: invalid numeric configuration') from None
+    if 'OPENAGENT_TOOL_POLICY' in os.environ:
+        try:
+            values = json.loads(os.environ['OPENAGENT_TOOL_POLICY'])
+            _apply_dict_to_config({'tool_policy': values}, config_data)
+        except (ValueError, TypeError):
+            raise ValueError('OPENAGENT_TOOL_POLICY: expected a JSON object of exact names and actions') from None
     if os.environ.get("OPENAGENT_WORKSPACE"):
         config_data["workspace"] = Path(os.environ["OPENAGENT_WORKSPACE"]).resolve()
     if os.environ.get("OPENAGENT_YES") or os.environ.get("OPENAGENT_AUTO_APPROVE"):
         val = (
             os.environ.get("OPENAGENT_YES") or os.environ.get("OPENAGENT_AUTO_APPROVE", "")
         ).lower()
+        if val not in ('1', 'true', 'yes', 'on', '0', 'false', 'no', 'off'):
+            raise ValueError('OPENAGENT_AUTO_APPROVE/OPENAGENT_YES: invalid boolean')
         config_data["auto_approve"] = val in ("1", "true", "yes", "on")
 
     # 5. Explicit overrides
@@ -318,31 +394,18 @@ def load_config(
         if v is not None:
             if k == "workspace":
                 config_data[k] = Path(v).resolve()
-            elif k == "danger_policy" and isinstance(v, Mapping):
-                current_p = dict(config_data.get("danger_policy", {}))
+            elif k in ("danger_policy", "tool_policy"):
+                current_p = dict(config_data.get(k, {}))
                 current_p.update(_normalize_danger_policy(v))
                 config_data[k] = current_p
             else:
                 config_data[k] = v
 
-    return OpenAgentConfig(
-        model=config_data["model"],
-        api_key=config_data["api_key"],
-        base_url=config_data["base_url"],
-        temperature=config_data["temperature"],
-        top_p=config_data["top_p"],
-        max_tokens=config_data["max_tokens"],
-        context_window=config_data["context_window"],
-        custom_provider=config_data["custom_provider"],
-        max_tool_iterations=config_data["max_tool_iterations"],
-        danger_policy=config_data["danger_policy"],
-        mcp_servers=config_data["mcp_servers"],
-        workspace=config_data["workspace"],
-        extra_instructions=config_data["extra_instructions"],
-        auto_approve=config_data["auto_approve"],
-        session_id=config_data["session_id"],
-        config_path=config_data["config_path"],
-    )
+    try:
+        return OpenAgentConfig(**config_data)
+    except (ValueError, TypeError) as exc:
+        source = config_data.get('config_path') or 'defaults/environment/CLI'
+        raise ValueError(f'Effective configuration ({source}): {exc}') from None
 
 
 def save_config(config: OpenAgentConfig, target_path: str | Path) -> None:
@@ -369,6 +432,7 @@ def save_config(config: OpenAgentConfig, target_path: str | Path) -> None:
         lines.append(f"context_window = {config.context_window}")
     lines.append(f"max_tool_iterations = {config.max_tool_iterations}")
     lines.append(f"auto_approve = {'true' if config.auto_approve else 'false'}")
+    lines.append(f"checkpoint_enabled = {'true' if config.checkpoint_enabled else 'false'}")
     lines.append(f"workspace = {_toml_value(config.workspace.as_posix())}")
 
     if config.extra_instructions:
@@ -388,6 +452,10 @@ def save_config(config: OpenAgentConfig, target_path: str | Path) -> None:
         lines.append(f"{_toml_value(danger)} = {_toml_value(act_val)}")
 
     # MCP servers
+    lines.append('\n[tool_policy]')
+    for name, action in config.tool_policy.items():
+        lines.append(f'{_toml_value(name)} = {_toml_value(action.value)}')
+
     for server in config.mcp_servers:
         lines.append("\n[[mcp_servers]]")
         for key, value in asdict(server).items():

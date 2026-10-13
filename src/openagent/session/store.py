@@ -10,6 +10,7 @@ Licensed under the Apache License, Version 2.0.
 from __future__ import annotations
 
 import contextlib
+import importlib
 import json
 import logging
 import math
@@ -26,6 +27,10 @@ from openagent.context.messages import MessageManager
 from openagent.core.types import Message
 
 logger = logging.getLogger(__name__)
+
+
+class SessionConflictError(RuntimeError):
+    """The saved session changed after this writer loaded it."""
 
 
 @dataclass
@@ -74,14 +79,59 @@ class SessionStore:
             self._storage_dir = Path(storage_dir).expanduser().resolve()
         self._storage_dir.mkdir(parents=True, exist_ok=True)
         self._cache: dict[str, tuple[SessionMetadata, list[str], tuple[int, int]]] = {}
+        self._revisions: dict[str, tuple[int, int] | None] = {}
+
+    @contextlib.contextmanager
+    def _locked(self, session_id: str):
+        self._get_session_path(session_id)
+        lock_path = self._storage_dir / f"{session_id}.lock"
+        with lock_path.open("a+b") as handle:
+            if handle.tell() == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                deadline = time.monotonic() + 30
+                while True:
+                    try:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(f"Timed out acquiring session lock for '{session_id}'") from None
+                        time.sleep(0.01)
+            else:
+                fcntl = importlib.import_module("fcntl")
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                if os.name == "nt":
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def _revision(self, session_id: str) -> tuple[int, int] | None:
+        path = self._get_session_path(session_id)
+        if not path.exists():
+            return None
+        stat = path.stat()
+        return stat.st_size, stat.st_mtime_ns
 
     def _remember(self, session_id: str, metadata: SessionMetadata, messages: Sequence[Message]) -> None:
         stat = self._get_session_path(session_id).stat()
+        self._cache.pop(session_id, None)
         self._cache[session_id] = (
             SessionMetadata.from_dict(metadata.to_dict()),
             [json.dumps(self._serialize_message(message), ensure_ascii=False) for message in messages],
             (stat.st_size, stat.st_mtime_ns),
         )
+        self._revisions[session_id] = (stat.st_size, stat.st_mtime_ns)
+        # Cached histories are an optimization, bounded independently of archive size.
+        while len(self._cache) > 8 or sum(sum(len(row.encode("utf-8")) for row in entry[1]) for entry in self._cache.values()) > 4 * 1024 * 1024:
+            self._cache.pop(next(iter(self._cache)))
 
     def _cached(self, session_id: str) -> tuple[SessionMetadata, list[str], tuple[int, int]] | None:
         cached = self._cache.get(session_id)
@@ -89,6 +139,8 @@ class SessionStore:
         if cached and target.exists():
             stat = target.stat()
             if cached[2] == (stat.st_size, stat.st_mtime_ns):
+                self._cache.pop(session_id)
+                self._cache[session_id] = cached
                 return cached
         self._cache.pop(session_id, None)
         return None
@@ -136,6 +188,13 @@ class SessionStore:
             metadata: Optional updated SessionMetadata. If omitted, existing metadata
                       is updated with new message count and updated timestamp.
         """
+        with self._locked(session_id):
+            revision = self._revision(session_id)
+            if session_id in self._revisions and self._revisions[session_id] != revision:
+                raise SessionConflictError(f"Session conflict for '{session_id}': reload or fork before saving")
+            self._save_messages(session_id, messages, metadata)
+
+    def _save_messages(self, session_id: str, messages: Sequence[Message], metadata: SessionMetadata | None = None) -> None:
         now = time.time()
         cached = self._cached(session_id)
         if metadata is None:
@@ -145,7 +204,7 @@ class SessionStore:
                     if cached:
                         existing_meta = cached[0]
                     else:
-                        existing_meta, _ = self.load_session(session_id)
+                        existing_meta, _ = self._load_session(session_id)
                         cached = self._cached(session_id)
                     metadata = SessionMetadata(
                         session_id=session_id,
@@ -229,6 +288,10 @@ class SessionStore:
         Raises:
             FileNotFoundError: If the session file does not exist.
         """
+        with self._locked(session_id):
+            return self._load_session(session_id)
+
+    def _load_session(self, session_id: str) -> tuple[SessionMetadata, list[Message]]:
         session_path = self._get_session_path(session_id)
         if not session_path.is_file():
             raise FileNotFoundError(f"Session '{session_id}' not found at {session_path}")
@@ -253,6 +316,7 @@ class SessionStore:
             return meta, []
 
         stat = session_path.stat()
+        self._revisions[session_id] = (stat.st_size, stat.st_mtime_ns)
         meta = SessionMetadata(
             session_id=session_id,
             created_at=stat.st_ctime,
@@ -315,7 +379,7 @@ class SessionStore:
         sessions: list[SessionMetadata] = []
         for file_path in self._storage_dir.glob("*.jsonl"):
             try:
-                metadata, _ = self.load_session(file_path.stem)
+                metadata = self.load_metadata(file_path.stem)
                 sessions.append(metadata)
             except Exception as exc:
                 logger.warning("Failed to read session header from %s: %s", file_path, exc)
@@ -323,6 +387,153 @@ class SessionStore:
 
         sessions.sort(key=lambda s: s.updated_at, reverse=True)
         return sessions
+
+    def load_metadata(self, session_id: str) -> SessionMetadata:
+        """Scan metadata and correspondence without retaining history or filling cache."""
+        with self._locked(session_id):
+            return self._load_metadata(session_id)
+
+    def _load_metadata(self, session_id: str) -> SessionMetadata:
+        path = self._get_session_path(session_id)
+        stat = path.stat()
+        meta = SessionMetadata(session_id, created_at=stat.st_ctime, updated_at=stat.st_mtime)
+        count = 0
+        pending: list[Message] = []
+
+        def lightweight(row: Mapping[str, Any]) -> Message:
+            message = self._deserialize_message(row)
+            message.content = []
+            message.metadata = {}
+            message.reasoning = None
+            for call in message.tool_calls:
+                call.arguments = {}
+                call.raw_arguments = ""
+            return message
+
+        def accept(message: Message) -> None:
+            nonlocal count, pending
+            if message.role != "tool" and pending:
+                if MessageManager.valid_tool_group(pending):
+                    count += len(pending)
+                pending = []
+            if message.tool_calls or message.role == "tool":
+                pending.append(message)
+            else:
+                count += 1
+
+        with path.open(encoding="utf-8", errors="replace") as source:
+            for lineno, line in enumerate(source, 1):
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                    if not isinstance(row, Mapping):
+                        raise ValueError("session row must be an object")
+                    if row.get("type") == "batch":
+                        decoded = [lightweight(item) for item in row["messages"]]
+                        batch_meta = SessionMetadata.from_dict(row["metadata"])
+                        for item in decoded:
+                            accept(item)
+                        meta = batch_meta
+                    elif row.get("type") == "metadata" or "session_id" in row:
+                        if lineno != 1:
+                            raise ValueError("unexpected metadata row")
+                        meta = SessionMetadata.from_dict(row)
+                    else:
+                        accept(lightweight(row))
+                except (TypeError, ValueError, AttributeError, KeyError):
+                    logger.warning("Session %s: skipped corrupt line %d", session_id, lineno)
+        if pending and MessageManager.valid_tool_group(pending):
+            count += len(pending)
+        meta.session_id = session_id
+        meta.message_count = count
+        return meta
+
+    def export_session(self, session_id: str, destination: str | Path, *, format: str = "jsonl", redact: bool = False) -> Path:
+        """Export full snapshots, or a display-only Markdown transcript.
+
+        Exports include user text and tool output. Redaction masks credential keys
+        and removes tool output; it cannot identify every secret in natural text.
+        """
+        session_id = self.resolve_session_id(session_id)
+        metadata, messages = self.load_session(session_id)
+        rows = [self._serialize_message(message) for message in messages]
+        if redact:
+            def mask(value: Any) -> Any:
+                if isinstance(value, Mapping):
+                    return {key: "[REDACTED]" if re.search(r"secret|password|api.?key|authorization|token", str(key), re.I) else mask(item) for key, item in value.items()}
+                if isinstance(value, list):
+                    return [mask(item) for item in value]
+                return value
+            rows = mask(rows)
+            for row in rows:
+                if row["role"] == "tool":
+                    row["content"] = [{"type": "text", "text": "[REDACTED tool output]"}]
+        meta = metadata.to_dict()
+        meta["type"] = "metadata"
+        if format == "json":
+            text = json.dumps({"schema_version": 1, "metadata": meta, "messages": rows}, ensure_ascii=False, indent=2) + "\n"
+        elif format == "jsonl":
+            text = "\n".join(json.dumps(row, ensure_ascii=False) for row in [meta, *rows]) + "\n"
+        elif format in {"markdown", "md"}:
+            text = f"# {metadata.title}\n\nDisplay-only transcript; use JSON/JSONL to resume.\n\n"
+            for row in rows:
+                message = self._deserialize_message(row)
+                text += f"## {message.role}\n\n{message.text}\n\n"
+                if message.tool_calls:
+                    text += "```json\n" + json.dumps(row["tool_calls"], ensure_ascii=False, indent=2) + "\n```\n\n"
+        else:
+            raise ValueError("Export format must be json, jsonl or markdown")
+        target = Path(destination).expanduser().resolve()
+        if target == self._get_session_path(session_id):
+            raise ValueError("Export destination must differ from source session")
+        temporary = target.with_name(f"{target.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temporary.write_text(text, encoding="utf-8")
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return target
+
+    def import_session(self, source: str | Path, *, new_id: bool = False) -> str:
+        """Strictly import JSON/full or incremental JSONL without overwriting IDs."""
+        text = Path(source).read_text(encoding="utf-8")
+        try:
+            document = json.loads(text)
+        except json.JSONDecodeError:
+            document = None
+        if isinstance(document, Mapping) and "messages" in document and "metadata" in document and document.get("type") != "batch":
+            if document.get("schema_version", 1) != 1:
+                raise ValueError("Unsupported session export schema version")
+            rows = [document["metadata"], *document["messages"]]
+        else:
+            rows = [json.loads(line) for line in text.splitlines() if line.strip()]
+        if not rows or not isinstance(rows[0], Mapping) or "session_id" not in rows[0]:
+            raise ValueError("Import requires session metadata")
+        metadata = SessionMetadata.from_dict(rows[0])
+        self._get_session_path(metadata.session_id)
+        messages: list[Message] = []
+        for row in rows[1:]:
+            if not isinstance(row, Mapping):
+                raise ValueError("Invalid session row")
+            if row.get("type") == "batch":
+                metadata = SessionMetadata.from_dict(row["metadata"])
+                self._get_session_path(metadata.session_id)
+                if metadata.session_id != rows[0]["session_id"]:
+                    raise ValueError("Batch session ID differs from snapshot")
+                messages.extend(self._deserialize_message(item) for item in row["messages"])
+            else:
+                messages.append(self._deserialize_message(row))
+        if any(not MessageManager.valid_tool_group(group) for group in MessageManager.get_atomic_groups(messages)):
+            raise ValueError("Incomplete or invalid tool correspondence")
+        session_id = uuid.uuid4().hex if new_id else metadata.session_id
+        metadata.session_id = session_id
+        metadata.message_count = len(messages)
+        with self._locked(session_id):
+            if self._get_session_path(session_id).exists():
+                raise FileExistsError(f"Session '{session_id}' already exists; import with a new ID")
+            self._atomic_write_session(session_id, metadata, messages)
+        return session_id
 
     def delete_session(self, session_id: str) -> bool:
         """Delete session data and any associated temporary files.
@@ -333,6 +544,10 @@ class SessionStore:
         Returns:
             True if session file was found and removed, False otherwise.
         """
+        with self._locked(session_id):
+            return self._delete_session(session_id)
+
+    def _delete_session(self, session_id: str) -> bool:
         session_path = self._get_session_path(session_id)
         self._cache.pop(session_id, None)
         existed = False
@@ -383,11 +598,14 @@ class SessionStore:
         cutoff = time.time() - older_than_days * 86400 if older_than_days is not None else None
         removed = 0
         for path in self._storage_dir.glob("*.jsonl"):
-            if cutoff is not None:
-                metadata, _ = self.load_session(path.stem)
-                if metadata.updated_at >= cutoff:
+            with self._locked(path.stem):
+                if not path.exists():
                     continue
-            removed += self.delete_session(path.stem)
+                if cutoff is not None:
+                    metadata = self._load_metadata(path.stem)
+                    if metadata.updated_at >= cutoff:
+                        continue
+                removed += self._delete_session(path.stem)
         return removed
 
     def _atomic_write_session(
@@ -444,6 +662,25 @@ class SessionStore:
             and isinstance(payload["data"], Mapping)
         ):
             payload = dict(payload["data"])
+
+        if payload.get("role") not in {"system", "user", "assistant", "tool"}:
+            raise ValueError("invalid message role")
+        content = payload.get("content")
+        if not isinstance(content, (str, list)):
+            raise ValueError("invalid message content")
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, Mapping) or part.get("type") not in {"text", "thinking", "image", "tool_result"}:
+                    raise ValueError("invalid content part")
+                if part.get("type") in {"text", "thinking"} and not isinstance(part.get("text"), str):
+                    raise ValueError("invalid text part")
+        if "metadata" in payload and not isinstance(payload["metadata"], Mapping):
+            raise ValueError("invalid message metadata")
+        if "created_at" in payload and (type(payload["created_at"]) not in (int, float) or not math.isfinite(payload["created_at"])):
+            raise ValueError("invalid message timestamp")
+        calls = payload.get("tool_calls", [])
+        if not isinstance(calls, list) or any(not isinstance(call, Mapping) or not isinstance(call.get("id"), str) or not call.get("id") or not isinstance(call.get("name"), str) or not isinstance(call.get("arguments", {}), (str, Mapping)) for call in calls):
+            raise ValueError("invalid tool calls")
 
         msg = Message.from_dict(payload)
         raw_tool_calls = payload.get("tool_calls")

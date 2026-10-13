@@ -60,7 +60,17 @@ class ProviderRouter:
                 return preset
         return None
 
-    def resolve(
+    def resolve(self, model_ref: str | ModelReference, **kwargs: Any) -> ChatProvider:
+        from .model_metadata import apply_model_metadata
+
+        context_override = kwargs.get("context_window")
+        output_override = kwargs.pop("max_output", None)
+        provider = self._resolve(model_ref, **kwargs)
+        return apply_model_metadata(
+            provider, context_override=context_override, output_override=output_override
+        )
+
+    def _resolve(
         self,
         model_ref: str | ModelReference,
         *,
@@ -197,6 +207,7 @@ class ProviderRouter:
             )
         key = preset.auth.resolve_key(api_key) if preset.auth.scheme != "none" else None
         kwargs.setdefault("extra_body", preset.body_defaults)
+        context_window = kwargs.pop("context_window", preset.context_window)
         effective_base_url = base_url or preset.base_url
         merged_headers = {**preset.headers, **dict(extra_headers or {})}
         provider: ChatProvider
@@ -209,7 +220,7 @@ class ProviderRouter:
                 base_url=effective_base_url,
                 api_key=key,
                 extra_headers=merged_headers,
-                context_window=preset.context_window,
+                context_window=context_window,
                 **kwargs,
             )
             provider.default_max_tokens = preset.max_output
@@ -224,7 +235,7 @@ class ProviderRouter:
                 base_url=effective_base_url,
                 api_key=key,
                 extra_headers=merged_headers,
-                context_window=preset.context_window,
+                context_window=context_window,
                 **kwargs,
             )
             provider.default_max_tokens = preset.max_output
@@ -239,7 +250,7 @@ class ProviderRouter:
                 base_url=effective_base_url,
                 api_key=key,
                 extra_headers=merged_headers,
-                context_window=preset.context_window,
+                context_window=context_window,
                 **kwargs,
             )
             provider.default_max_tokens = preset.max_output
@@ -257,7 +268,7 @@ class ProviderRouter:
             headers=merged_headers,
             auth_header=preset.auth.header
             or ("authorization" if preset.auth.scheme == "bearer" else preset.auth.scheme),
-            context_window=preset.context_window,
+            context_window=context_window,
             **kwargs,
         )
 

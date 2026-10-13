@@ -50,6 +50,7 @@ class OllamaProvider(ChatProvider):
     """Native adapter for local Ollama `/api/chat` service."""
 
     name = "ollama"
+    supported_tool_choices = ("auto", "none")
     tool_protocol = ToolProtocol.JSON_SCHEMA
     supports_vision = True
     supports_reasoning = True
@@ -157,19 +158,24 @@ class OllamaProvider(ChatProvider):
         if options:
             payload["options"] = options
 
-        if request.tools:
+        if request.tools and request.tool_choice == "required":
+            raise ProviderError("Ollama does not support required tool choice", provider=self.name)
+        if request.tools and request.tool_choice != "none":
             payload["tools"] = [spec.to_openai_schema() for spec in request.tools]
 
         payload.update(self.extra_body)
+        if request.tool_choice == "none":
+            payload.pop("tools", None)
+            payload.pop("tool_choice", None)
         return payload
 
     # -- streaming ---------------------------------------------------------- #
 
     async def stream(self, request: ChatRequest) -> AsyncIterator[StreamEvent]:
-        payload = self.build_payload(request)
         headers = {"accept": "application/x-ndjson, */*"}
 
         try:
+            payload = self.build_payload(request)
             response = await self._transport.stream_post("/api/chat", payload, headers=headers)
         except ProviderError as exc:
             yield ErrorEvent(error=exc)
@@ -218,6 +224,10 @@ class OllamaProvider(ChatProvider):
                         yield TextDelta(text=text)
 
                 tool_calls = msg_obj.get("tool_calls")
+                if request.tool_choice == "none" and tool_calls:
+                    raise ProviderError(
+                        "provider returned forbidden tool calls", provider=self.name
+                    )
                 if tool_calls and isinstance(tool_calls, list):
                     for tc in tool_calls:
                         fn = tc.get("function") or {}
@@ -269,24 +279,7 @@ class OllamaProvider(ChatProvider):
                     break
 
             if not done_received:
-                for thinking, text in thinking_parser.feed("", final=True):
-                    if thinking:
-                        reasoning_parts.append(text)
-                        yield ThinkingDelta(text=text)
-                    else:
-                        text_parts.append(text)
-                        yield TextDelta(text=text)
-                if calls:
-                    finish_reason = FinishReason.TOOL_CALLS
-                yield DoneEvent(
-                    finish_reason=finish_reason,
-                    message=Message.assistant(
-                        "".join(text_parts),
-                        tool_calls=calls,
-                        reasoning="".join(reasoning_parts) or None,
-                    ),
-                    usage=usage,
-                )
+                raise ProviderError("stream ended before done:true", provider=self.name)
         except httpx.HTTPError as exc:
             error = ProviderError(f"network error: {exc}", retryable=True, provider=self.name)
             yield ErrorEvent(error=error, retryable=True)
@@ -296,19 +289,16 @@ class OllamaProvider(ChatProvider):
             await response.aclose()
 
     async def list_models(self) -> list[ModelInfo]:
-        try:
-            data = await self._transport.get_json("/api/tags")
-            models = data.get("models", [])
-            return [
-                ModelInfo(
-                    id=m.get("name", ""),
-                    provider=self.name,
-                )
-                for m in models
-                if isinstance(m, dict) and "name" in m
-            ]
-        except Exception:
-            return []
+        data = await self._transport.get_json("/api/tags")
+        models = data.get("models", [])
+        return [
+            ModelInfo(
+                id=m.get("name", ""),
+                provider=self.name,
+            )
+            for m in models
+            if isinstance(m, dict) and "name" in m
+        ]
 
     async def close(self) -> None:
         await self._transport.aclose()

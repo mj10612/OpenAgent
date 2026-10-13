@@ -75,8 +75,12 @@ class CustomJsonPathProvider(ChatProvider):
         timeout: float = 600.0,
         max_retries: int = 3,
         context_window: int | None = None,
+        usage_mode: str = "delta",
         client: Any = None,
     ) -> None:
+        if usage_mode not in {"delta", "cumulative", "final"}:
+            raise ValueError("usage_mode must be delta, cumulative, or final")
+        self.usage_mode = usage_mode
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.chat_endpoint = chat_endpoint
@@ -256,7 +260,8 @@ class CustomJsonPathProvider(ChatProvider):
             payload["top_p"] = request.top_p
         if request.max_tokens is not None:
             payload["max_tokens"] = request.max_tokens
-        if request.tools:
+        if request.tools and request.tool_choice != "none":
+            payload["tool_choice"] = request.tool_choice
             payload["tools"] = [t.to_openai_schema() for t in request.tools]
         return payload
 
@@ -280,68 +285,57 @@ class CustomJsonPathProvider(ChatProvider):
             content_type = response.headers.get("content-type", "").lower()
             is_sse = "text/event-stream" in content_type
 
-            if is_sse:
-                async for event in iter_sse(response):
-                    if event.data == "[DONE]":
-                        break
-                    if not event.data.strip():
-                        continue
-                    try:
-                        chunk = json.loads(event.data)
-                    except json.JSONDecodeError:
-                        continue
-                    for ev in self.parse_chunk(chunk, partials):
-                        if isinstance(ev, ErrorEvent):
+            async for chunk in _iter_custom_chunks(response, is_sse=is_sse):
+                if isinstance(chunk, dict) and chunk.get("error"):
+                    raise ProviderError(f"response error: {chunk['error']}", provider=self.name)
+                for ev in self.parse_chunk(chunk, partials):
+                    if request.tool_choice == "none" and isinstance(
+                        ev, (ToolCallStart, ToolCallDelta, ToolCallEnd)
+                    ):
+                        raise ProviderError(
+                            "provider returned forbidden tool calls", provider=self.name
+                        )
+                    if isinstance(ev, ErrorEvent):
+                        yield ev
+                        return
+                    match ev:
+                        case ThinkingDelta(text=t):
+                            thinking_parts.append(t)
                             yield ev
-                            return
-                        match ev:
-                            case ThinkingDelta(text=t):
-                                thinking_parts.append(t)
-                                yield ev
-                            case TextDelta(text=t):
-                                text_parts.append(t)
-                                yield ev
-                            case ToolCallEnd(call=c) if c is not None:
-                                calls.append(c)
-                                yield ev
-                            case UsageEvent(usage=u):
-                                usage = usage + u
-                                yield ev
-                            case _:
-                                yield ev
-            else:
-                async for line in response.aiter_lines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if line.startswith("data:"):
-                        line = line[5:].strip()
-                        if line == "[DONE]":
-                            break
-                    try:
-                        chunk = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    for ev in self.parse_chunk(chunk, partials):
-                        if isinstance(ev, ErrorEvent):
+                        case TextDelta(text=t):
+                            text_parts.append(t)
                             yield ev
-                            return
-                        match ev:
-                            case ThinkingDelta(text=t):
-                                thinking_parts.append(t)
-                                yield ev
-                            case TextDelta(text=t):
-                                text_parts.append(t)
-                                yield ev
-                            case ToolCallEnd(call=c) if c is not None:
-                                calls.append(c)
-                                yield ev
-                            case UsageEvent(usage=u):
+                        case ToolCallEnd(call=c) if c is not None:
+                            calls.append(c)
+                            yield ev
+                        case UsageEvent(usage=u):
+                            if self.usage_mode == "delta":
                                 usage = usage + u
-                                yield ev
-                            case _:
-                                yield ev
+                                yield UsageEvent(usage=usage)
+                            else:
+                                prompt_present = bool(
+                                    self._usage_prompt_expr and self._usage_prompt_expr.find(chunk)
+                                )
+                                output_present = bool(
+                                    self._usage_completion_expr
+                                    and self._usage_completion_expr.find(chunk)
+                                )
+                                latest = Usage(
+                                    prompt_tokens=u.prompt_tokens
+                                    if prompt_present
+                                    else usage.prompt_tokens,
+                                    completion_tokens=u.completion_tokens
+                                    if output_present
+                                    else usage.completion_tokens,
+                                )
+                                usage = latest
+                                if self.usage_mode == "cumulative":
+                                    yield UsageEvent(usage=usage)
+                        case _:
+                            yield ev
 
+            if self.usage_mode == "final" and usage.total_tokens:
+                yield UsageEvent(usage=usage)
             for index, slot in sorted(partials.items()):
                 call = ToolCall(
                     slot["name"],
@@ -374,3 +368,90 @@ class CustomJsonPathProvider(ChatProvider):
 
     async def close(self) -> None:
         await self._transport.aclose()
+
+
+async def _iter_custom_chunks(response: Any, *, is_sse: bool) -> AsyncIterator[Any]:
+    """Decode explicit framing with a bounded JSON document fallback."""
+    if is_sse:
+        seen = False
+        async for event in iter_sse(_BoundedResponseLines(response)):
+            if event.data.strip() == "[DONE]":
+                if not seen:
+                    raise ProviderError("empty SSE response")
+                return
+            if event.data.strip():
+                try:
+                    seen = True
+                    yield json.loads(event.data)
+                except json.JSONDecodeError as exc:
+                    raise ProviderError(f"invalid SSE JSON: {exc}") from exc
+        if not seen:
+            raise ProviderError("empty SSE response")
+        return
+    content_type = response.headers.get("content-type", "").lower()
+    if "ndjson" in content_type or "jsonl" in content_type:
+        seen = False
+        async for line in _BoundedResponseLines(response).aiter_lines():
+            if line.strip():
+                try:
+                    seen = True
+                    yield json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ProviderError(f"invalid NDJSON: {exc}") from exc
+        if not seen:
+            raise ProviderError("empty NDJSON response")
+        return
+    chunks: list[bytes] = []
+    size = 0
+    async for piece in response.aiter_bytes():
+        size += len(piece)
+        if size > 8 * 1024 * 1024:
+            raise ProviderError("JSON response exceeds 8 MiB limit")
+        chunks.append(piece)
+    body = b"".join(chunks).strip()
+    if not body:
+        raise ProviderError("empty JSON response")
+    try:
+        value = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        # Missing content type gateways may explicitly use NDJSON.
+        if not content_type:
+            try:
+                values = [json.loads(line) for line in body.splitlines() if line.strip()]
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                raise ProviderError(f"invalid JSON response: {exc}") from exc
+            for value in values:
+                yield value
+            return
+        raise ProviderError(f"invalid JSON response: {exc}") from exc
+    if not isinstance(value, (dict, list)):
+        raise ProviderError("JSON response must be an object or array")
+    yield value
+
+
+class _BoundedResponseLines:
+    """Limit decoded stream bytes before buffering an SSE/NDJSON line."""
+
+    def __init__(self, response: Any) -> None:
+        self.response = response
+
+    async def aiter_lines(self) -> AsyncIterator[str]:
+        import codecs
+
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+        size = 0
+        pending = ""
+        try:
+            async for piece in self.response.aiter_bytes():
+                size += len(piece)
+                if size > 8 * 1024 * 1024:
+                    raise ProviderError("stream response exceeds 8 MiB limit")
+                pending += decoder.decode(piece)
+                while "\n" in pending:
+                    line, pending = pending.split("\n", 1)
+                    yield line.rstrip("\r")
+            pending += decoder.decode(b"", final=True)
+            if pending:
+                yield pending.rstrip("\r")
+        except UnicodeDecodeError as exc:
+            raise ProviderError("invalid UTF-8 stream response") from exc

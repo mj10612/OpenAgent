@@ -19,6 +19,19 @@ from openagent.tools.registry import ToolRegistry
 logger = logging.getLogger(__name__)
 
 
+async def _close_owned(client: MCPClient) -> None:
+    """Complete bounded cleanup even when the requesting task is cancelled."""
+    task = asyncio.create_task(client.close())
+    try:
+        await asyncio.wait_for(asyncio.shield(task), 10)
+    except asyncio.CancelledError:
+        await asyncio.wait_for(asyncio.shield(task), 10)
+        raise
+    finally:
+        if not task.done():
+            task.cancel()
+
+
 class MCPManager:
     """Orchestrates lifecycle, discovery, and registration of multiple MCP servers."""
 
@@ -72,17 +85,28 @@ class MCPManager:
                 for tool in old:
                     if self.registry.get(tool.name) is tool:
                         self.registry.unregister(tool.name)
-                for tool in wrapped:
-                    self.registry.register(tool)
+                registered: list[MCPTool] = []
+                try:
+                    for tool in wrapped:
+                        self.registry.register(tool)
+                        registered.append(tool)
+                except BaseException:
+                    for tool in registered:
+                        if self.registry.get(tool.name) is tool:
+                            self.registry.unregister(tool.name)
+                    for tool in old:
+                        self.registry.register(tool)
+                    raise
                 self.tools[name] = wrapped
                 self.failed_servers.pop(name, None)
                 self._retry_after.pop(name, None)
                 return wrapped
-            except Exception as exc:
-                self.failed_servers[name] = exc
+            except BaseException as exc:
+                if isinstance(exc, Exception):
+                    self.failed_servers[name] = exc
                 self._retry_after[name] = time.monotonic() + 1.0
                 with contextlib.suppress(Exception):
-                    await client.close()
+                    await _close_owned(client)
                 raise
 
     def add_server(self, config: MCPServerConfig) -> None:
@@ -99,6 +123,7 @@ class MCPManager:
             await self.stop_server(name)
 
         client = self._client_factory(config)
+        self.clients[name] = client
         wrapped_tools: list[MCPTool] = []
         try:
             await client.connect()
@@ -112,13 +137,15 @@ class MCPManager:
             self.tools[name] = wrapped_tools
             self.failed_servers.pop(name, None)
             return wrapped_tools
-        except Exception as exc:
-            self.failed_servers[name] = exc
+        except BaseException as exc:
+            if isinstance(exc, Exception):
+                self.failed_servers[name] = exc
             logger.warning("Failed to connect to MCP server '%s': %s", name, exc)
             for tool in wrapped_tools:
                 self.registry.unregister(tool.name)
+            self.clients.pop(name, None)
             with contextlib.suppress(Exception):
-                await client.close()
+                await _close_owned(client)
             raise
 
     async def stop_server(self, name: str) -> None:
@@ -131,7 +158,7 @@ class MCPManager:
         client = self.clients.pop(name, None)
         if client is not None:
             try:
-                await client.close()
+                await _close_owned(client)
             except Exception as exc:
                 logger.debug("Error while closing MCP client '%s': %s", name, exc)
 

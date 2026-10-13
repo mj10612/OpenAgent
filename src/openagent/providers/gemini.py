@@ -220,6 +220,7 @@ class GeminiProvider(ChatProvider):
             response_parts: list[dict[str, Any]] = []
             usage = Usage()
             finish_reason = FinishReason.STOP
+            terminal_received = False
 
             async for event in iter_sse(response):
                 if event.data == "[DONE]":
@@ -252,6 +253,7 @@ class GeminiProvider(ChatProvider):
                 for candidate in candidates:
                     cand_finish = candidate.get("finishReason")
                     if cand_finish:
+                        terminal_received = True
                         match cand_finish:
                             case "STOP":
                                 finish_reason = FinishReason.STOP
@@ -285,6 +287,10 @@ class GeminiProvider(ChatProvider):
                                 yield TextDelta(text=txt, index=len(text_parts) - 1)
 
                         if "functionCall" in part:
+                            if request.tool_choice == "none":
+                                raise ProviderError(
+                                    "provider returned forbidden tool calls", provider=self.name
+                                )
                             fc = part["functionCall"]
                             call_name = fc.get("name", "")
                             args = fc.get("args") or {}
@@ -303,11 +309,15 @@ class GeminiProvider(ChatProvider):
                             yield ToolCallEnd(index=len(calls), call=call)
                             calls.append(call)
 
+            if not terminal_received:
+                raise ProviderError("stream ended before finishReason", provider=self.name)
             if calls:
                 finish_reason = FinishReason.TOOL_CALLS
 
             assistant_message = Message.assistant(
-                "".join(text_parts), tool_calls=calls, reasoning="".join(reasoning_parts) or None,
+                "".join(text_parts),
+                tool_calls=calls,
+                reasoning="".join(reasoning_parts) or None,
             )
             assistant_message.metadata["gemini_parts"] = response_parts
             yield DoneEvent(
@@ -324,21 +334,18 @@ class GeminiProvider(ChatProvider):
             await response.aclose()
 
     async def list_models(self) -> list[ModelInfo]:
-        try:
-            data = await self._transport.get_json("/models")
-            items = data.get("models", [])
-            return [
-                ModelInfo(
-                    id=m.get("name", "").removeprefix("models/"),
-                    provider=self.name,
-                    context_window=m.get("inputTokenLimit"),
-                    max_output=m.get("outputTokenLimit"),
-                )
-                for m in items
-                if isinstance(m, dict)
-            ]
-        except Exception:
-            return []
+        data = await self._transport.get_json("/models")
+        items = data.get("models", [])
+        return [
+            ModelInfo(
+                id=m.get("name", "").removeprefix("models/"),
+                provider=self.name,
+                context_window=m.get("inputTokenLimit"),
+                max_output=m.get("outputTokenLimit"),
+            )
+            for m in items
+            if isinstance(m, dict)
+        ]
 
     async def close(self) -> None:
         await self._transport.aclose()

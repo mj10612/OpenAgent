@@ -537,3 +537,106 @@ Azure and Bedrock preset identifiers currently fail explicitly: native Azure
 and AWS signing adapters are not implemented. Use an appropriately configured
 OpenAI-compatible gateway instead. Native adapters are Anthropic, Gemini, and
 Ollama.
+
+## Automation, diagnostics and recovery
+
+```bash
+openagent run "inspect the project" --json
+openagent run "inspect the project" --jsonl
+openagent doctor --json
+openagent doctor --network --model ollama/llava
+openagent models --discover --model ollama/llava --json
+openagent models --discover --refresh --model ollama/llava
+openagent run "explain this screenshot" --image "screenshots/UI error.png"
+openagent sessions export <id> --output backup.jsonl
+openagent sessions export <id> --format markdown --redact --output conversation.md
+openagent sessions import backup.jsonl --new-id
+openagent sessions convert legacy.jsonl --output converted.jsonl
+openagent run "update the file" --tool-policy write_file=allow --tool-policy delete_file=deny
+```
+
+JSON/JSONL output has `schema_version: 1`. JSON contains a terminal result;
+JSONL contains ordered typed events followed by that result. Terminal outcomes
+are `success`, `error`, `partial_failure`, `iteration_limit`, or `cancelled`,
+with exit codes 0, 1, 1, 1, and 130 respectively. Usage totals include failed
+generation requests and LLM compaction without counting snapshots twice.
+Noninteractive machine output denies ASK tools unless `--yes` or an explicit
+allow policy is configured. DENY always wins over `--yes`. Approval previews
+and registration warnings use stderr. Configured credentials are redacted from
+machine output; conversation content itself can still contain user secrets.
+
+`doctor` is offline by default: it checks configuration, credential presence,
+Python/shell, MCP commands and working directories, and session storage readiness.
+It runs no tools and makes no model requests. `--network` explicitly permits model
+discovery at the configured provider endpoint, with no paid generation. Errors
+in required checks exit 1; optional unavailable remote checks are warnings.
+Discovery caches only model metadata for one hour. Context/output values absent
+from a provider response stay unknown; discovered values take precedence over
+preset/heuristic limits, and explicit configuration takes precedence over both.
+Custom providers currently do not support model discovery.
+
+Images use local base64 PNG/JPEG/GIF/WebP files, up to four files of 5 MiB each.
+Remote image URLs are not accepted by CLI/REPL. Ollama rejects GIF input. Unknown
+or unsupported model vision capabilities fail before generation; known vision
+families or discovered capability metadata are required. In chat, `/attach <path>`
+queues an image for the next prompt and `/attachments clear` discards attachments.
+Image contents remain in saved sessions and count against context estimates;
+avoid keeping large attachments in long-running sessions.
+
+Builtin filesystem mutations are checkpointed per turn, including failed and
+cancelled turns. `/changes` shows their diffs and `/undo` restores the latest
+turn only if files still match its recorded result. Content, mode and line endings
+are preserved; external shell/network/MCP side effects cannot be undone. Recovery
+does not run git reset. Checkpoints are memory-only, limited to twenty turns and
+40 MiB of retained pre-change data (2 MiB per file). They disappear on process exit.
+Set `checkpoint_enabled = false` in TOML to disable this facility.
+
+Export/import supports JSON and JSONL, with Markdown export for human reading.
+`--redact` masks credential-like field names and replaces tool output; it is not
+a guarantee that prose or images contain no secrets. Import validates the complete file
+before publishing and refuses existing session IDs unless `--new-id` is used.
+Concurrent stale session saves raise a conflict instead of replacing another
+writer's conversation. Reload or import/export into a new session to branch.
+Persistent `.lock` files coordinate processes and contain no conversation data.
+Resume uses the effective configuration/CLI model; saved metadata records the
+model most recently used to save the session.
+
+Settings keep global → project → explicit file → environment → CLI precedence.
+Unknown keys, invalid types/ranges, nonfinite numbers and invalid permission
+actions fail before execution. Policies merge by exact tool name; wildcards are
+unsupported. Unregistered names generate a warning after MCP startup, and their
+policies persist across registration/reconnect. Environment overrides use a JSON
+object, for example `OPENAGENT_TOOL_POLICY='{"write_file":"allow"}'` (PowerShell:
+`$env:OPENAGENT_TOOL_POLICY = '{"write_file":"allow"}'`).
+
+```toml
+[tool_policy]
+write_file = "allow"
+delete_file = "deny"
+"server__lookup" = "ask"
+
+[custom_provider]
+usage_mode = "cumulative" # delta (default), cumulative, or final
+
+[[mcp_servers]]
+name = "remote"
+transport = "streamable_http"
+url = "https://example.com/mcp"
+timeout = 30
+read_timeout = 120
+```
+
+Custom `delta` adds each reported usage increment; `cumulative` merges cumulative
+snapshots; `final` uses the final reported values. Public usage events are cumulative
+per-request snapshots. Custom JSON documents, SSE and NDJSON are bounded and empty
+or malformed responses fail explicitly. Tool choice `none` suppresses tool exposure
+and rejects forbidden returned calls; unsupported `required` choices fail explicitly.
+OpenAI streams require finish_reason or `[DONE]`, Anthropic requires `message_stop`,
+Gemini requires `finishReason`, and Ollama requires `done: true`. Premature EOF
+produces an error and never executes partial calls.
+
+MCP stdio and SSE remain supported alongside Streamable HTTP (MCP SDK 2.2+).
+HTTP sessions are closed on shutdown; expired sessions reconnect on the next call,
+without replaying the failed operation. MCP textual and structured results retain
+error/size metadata and enforce a 2 MiB combined result bound. `web_fetch` handles
+concatenated gzip members under cumulative encoded and decoded size limits.

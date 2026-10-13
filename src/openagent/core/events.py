@@ -83,7 +83,13 @@ class ToolResultEvent:
 
 @dataclass(slots=True)
 class UsageEvent:
-    """Token accounting reported by the provider, often only at the very end."""
+    """Cumulative reported usage for the current provider request.
+
+    Adapters normalize vendor deltas to snapshots. Consumers reconcile fields
+    with the terminal DoneEvent instead of adding repeated snapshots. A runner
+    may also emit a summary request's usage before the generation StartEvent;
+    its final DoneEvent reports the total for the entire agent turn.
+    """
 
     usage: Usage
 

@@ -554,10 +554,10 @@ async def test_runner_max_iterations_guard() -> None:
     async for ev in runner.run_turn("Loop forever"):
         events.append(ev)
 
-    # Must terminate with finish_reason == LENGTH
+    # An agent iteration cap is an incomplete run, distinct from provider LENGTH.
     terminal = events[-1]
-    assert isinstance(terminal, DoneEvent)
-    assert terminal.finish_reason == FinishReason.LENGTH
+    assert isinstance(terminal, ErrorEvent)
+    assert "maximum tool call iterations" in str(terminal.error)
 
 
 @pytest.mark.asyncio

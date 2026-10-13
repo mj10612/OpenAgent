@@ -108,6 +108,12 @@ class ChatProvider(abc.ABC):
     #: Default context window, used for budgeting when unknown.
     default_context_window: int = 128_000
     default_max_tokens: int | None = None
+    context_window: int = 128_000
+    model_metadata_source: str = "preset"
+    model_supports_vision: bool | None = None
+    model_supports_tools: bool | None = None
+    model_supports_reasoning: bool | None = None
+    supported_tool_choices: tuple[str, ...] = ("auto", "none", "required")
 
     # -- required ---------------------------------------------------------- #
 
@@ -134,6 +140,7 @@ class ChatProvider(abc.ABC):
         usage = Usage()
         message: Message | None = None
         finish = "stop"
+        terminal_received = False
 
         async for event in self.stream(request):
             from .events import (
@@ -153,8 +160,14 @@ class ChatProvider(abc.ABC):
                 case ToolCallEnd(call=c) if c is not None:
                     calls.append(c)
                 case UsageEvent(usage=u):
-                    usage = usage + u
+                    usage = Usage(
+                        prompt_tokens=max(usage.prompt_tokens, u.prompt_tokens),
+                        completion_tokens=max(usage.completion_tokens, u.completion_tokens),
+                        cached_tokens=max(usage.cached_tokens, u.cached_tokens),
+                        reasoning_tokens=max(usage.reasoning_tokens, u.reasoning_tokens),
+                    )
                 case DoneEvent() as done:
+                    terminal_received = True
                     finish = done.finish_reason.value
                     # Terminal usage is authoritative; streamed usage is a fallback.
                     if any(
@@ -169,6 +182,8 @@ class ChatProvider(abc.ABC):
                 case ErrorEvent(error=e):
                     raise e if isinstance(e, BaseException) else ProviderError(str(e))
 
+        if not terminal_received:
+            raise ProviderError("stream ended without a terminal event", provider=self.name)
         if message is None:
             message = Message.assistant(
                 "".join(text_parts),
@@ -200,6 +215,16 @@ class ChatProvider(abc.ABC):
 def render_system_prompt(request: ChatRequest) -> str:
     """Join all system messages in a request."""
     return "\n\n".join(m.text for m in request.messages if m.role == "system" and m.text)
+
+
+def render_tool_arguments(call: ToolCall) -> str:
+    """Preserve wire JSON or serialize the canonical parsed arguments."""
+    if call.raw_arguments:
+        return call.raw_arguments
+    try:
+        return json.dumps(call.arguments, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ProviderError(f"could not serialize tool arguments: {exc}") from exc
 
 
 def coerce_arguments(raw: str | Mapping[str, Any] | None) -> dict[str, Any]:

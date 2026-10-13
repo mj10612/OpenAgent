@@ -27,7 +27,7 @@ from openagent.core.events import (
     ToolResultEvent,
     UsageEvent,
 )
-from openagent.core.provider import ChatProvider
+from openagent.core.provider import ChatProvider, ProviderError
 from openagent.core.types import (
     ChatRequest,
     FinishReason,
@@ -79,6 +79,10 @@ class AgentRunner:
         self.session_id = session_id
         self.max_tool_iterations = max_tool_iterations
         self.explicit_max_tokens = max_tokens
+        self.explicit_context_window = context_window
+        self.usage = Usage()
+        self.generation_usage = Usage()
+        self.compaction_usage = Usage()
         self.max_tokens = (
             max_tokens if max_tokens is not None else getattr(provider, "default_max_tokens", None)
         )
@@ -89,7 +93,7 @@ class AgentRunner:
             or getattr(provider, "default_context_window", 128_000)
             or 128_000
         )
-        if self.context_window <= 0 or (self.max_tokens is not None and self.max_tokens <= 0):
+        if self.max_tool_iterations <= 0 or self.context_window <= 0 or (self.max_tokens is not None and self.max_tokens <= 0):
             raise ValueError("Context window and output token limit must be positive.")
         self.temperature = temperature
         self.top_p = top_p
@@ -133,7 +137,9 @@ class AgentRunner:
         if self.session_store is not None:
             if self.session_id is None:
                 self.session_id = self.session_store.create_session(model=self.model)
-            self.session_store.save_messages(self.session_id, self.messages.messages)
+            metadata = self.session_store.load_metadata(self.session_id)
+            metadata.model = self.model
+            self.session_store.save_messages(self.session_id, self.messages.messages, metadata=metadata)
 
     async def run_turn(
         self,
@@ -141,6 +147,7 @@ class AgentRunner:
         ask_callback: AskCallback | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Execute a transaction, restoring history on errors or interrupted consumption."""
+        self.tools.changes.begin_turn()
         self._ensure_system_prompt()
         initial_messages = self.messages.copy().messages
         initial_session_id = self.session_id
@@ -201,13 +208,23 @@ class AgentRunner:
                 return
             # Check token budget and invoke Compactor if budget is exceeded
             if self.compactor is not None and self.messages.total_tokens() > input_budget:
-                compacted = await self.compactor.compact(
-                    self.messages.messages,
-                    input_budget,
-                    provider=self.provider,
-                )
+                before_usage = self.compactor.usage
+                try:
+                    compacted = await self.compactor.compact(
+                        self.messages.messages,
+                        input_budget,
+                        provider=self.provider,
+                    )
+                finally:
+                    after_usage = self.compactor.usage
+                    summary_usage = Usage(*(getattr(after_usage, field) - getattr(before_usage, field) for field in ("prompt_tokens", "completion_tokens", "reasoning_tokens", "cached_tokens")))
+                    self.compaction_usage = self.compaction_usage + summary_usage
+                    self.usage = self.usage + summary_usage
+                    cumulative_usage = cumulative_usage + summary_usage
                 self.messages.clear()
                 self.messages.extend(compacted)
+                if summary_usage.total_tokens:
+                    yield UsageEvent(summary_usage)
 
             # Window messages maintaining Atomic Tool Pair Invariant
             req_messages = self.messages.window(input_budget)
@@ -246,13 +263,14 @@ class AgentRunner:
                                 calls.append(c)
                             yield event
                         case UsageEvent(usage=u):
-                            step_usage = step_usage + u
+                            # Provider usage events are request snapshots, not deltas.
+                            step_usage = self._reconcile_usage(step_usage, u)
                             yield event
                         case DoneEvent() as done:
                             done_event = done
                         case ErrorEvent() as err:
                             error_encountered = err
-                            yield event
+                            break
                         case StartEvent():
                             yield event
                         case _:
@@ -263,16 +281,20 @@ class AgentRunner:
                 self.messages.extend(initial_messages)
                 yield err_ev
                 return
+            finally:
+                if done_event is not None:
+                    step_usage = self._reconcile_usage(step_usage, done_event.usage)
+                self._account_generation(step_usage)
+            cumulative_usage = cumulative_usage + step_usage
 
             if error_encountered is not None:
                 self.messages.clear()
                 self.messages.extend(initial_messages)
+                yield error_encountered
                 return
-
-            if done_event is not None and done_event.usage.total_tokens > 0:
-                cumulative_usage = cumulative_usage + done_event.usage
-            else:
-                cumulative_usage = cumulative_usage + step_usage
+            if done_event is None:
+                yield ErrorEvent(ProviderError("Provider stream ended without a terminal DoneEvent"))
+                return
 
             # Record assistant turn in messages
             if done_event is not None and done_event.message is not None:
@@ -339,17 +361,15 @@ class AgentRunner:
 
         else:
             # Reached max_tool_iterations without model concluding
-            terminal_event = DoneEvent(
-                finish_reason=FinishReason.LENGTH,
-                message=Message.assistant(
-                    "Reached maximum tool call iterations without concluding."
-                ),
-                usage=cumulative_usage,
-            )
-            assert terminal_event.message is not None
-            self.messages.append(terminal_event.message)
-            self._persist_session()
-            yield terminal_event
+            yield ErrorEvent(RuntimeError("Reached maximum tool call iterations without concluding."))
+
+    @staticmethod
+    def _reconcile_usage(a: Usage, b: Usage) -> Usage:
+        return Usage(*(max(getattr(a, field), getattr(b, field)) for field in ("prompt_tokens", "completion_tokens", "reasoning_tokens", "cached_tokens")))
+
+    def _account_generation(self, usage: Usage) -> None:
+        self.generation_usage = self.generation_usage + usage
+        self.usage = self.usage + usage
 
     async def run_turn_to_completion(
         self,

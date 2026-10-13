@@ -241,6 +241,7 @@ class AnthropicProvider(ChatProvider):
             content_blocks: dict[int, TextPart | ThinkingPart] = {}
             native_blocks: dict[int, dict[str, Any]] = {}
             stop_reason = "end_turn"
+            terminal_received = False
             usage = Usage()
 
             try:
@@ -275,6 +276,10 @@ class AnthropicProvider(ChatProvider):
                             elif block.get("type") == "text":
                                 content_blocks[block_index] = TextPart(block.get("text", ""))
                             if block.get("type") == "tool_use":
+                                if request.tool_choice == "none":
+                                    raise ProviderError(
+                                        "provider returned forbidden tool calls", provider=self.name
+                                    )
                                 block_index = data.get("index", len(partial_args))
                                 partial_args[block_index] = ""
                                 pending_names[block_index] = block.get("name", "")
@@ -354,6 +359,7 @@ class AnthropicProvider(ChatProvider):
                                 )
 
                         case "message_stop":
+                            terminal_received = True
                             pass
 
                         case "error":
@@ -371,6 +377,12 @@ class AnthropicProvider(ChatProvider):
                 return
             except Exception as exc:
                 yield ErrorEvent(error=exc)
+                return
+
+            if not terminal_received:
+                yield ErrorEvent(
+                    error=ProviderError("stream ended before message_stop", provider=self.name)
+                )
                 return
 
             # A tool block may be open at the moment the stream ends.
@@ -409,10 +421,10 @@ class AnthropicProvider(ChatProvider):
             ModelInfo(
                 id=entry.get("id", ""),
                 provider=self.name,
-                context_window=200_000,
-                max_output=8192,
-                supports_vision=True,
-                supports_tools=True,
+                context_window=entry.get("context_window"),
+                max_output=entry.get("max_output_tokens"),
+                supports_vision=entry.get("vision"),
+                supports_tools=entry.get("tool_calling"),
             )
             for entry in body.get("data") or ()
             if entry.get("id")

@@ -10,8 +10,10 @@ Licensed under the Apache License, Version 2.0.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import signal
+from pathlib import Path
 from types import FrameType
 from typing import Any
 
@@ -39,7 +41,7 @@ from openagent.core.events import (
     UsageEvent,
 )
 from openagent.core.router import ProviderRouter
-from openagent.core.types import ToolCall, Usage
+from openagent.core.types import Message, ToolCall, Usage
 from openagent.tools.registry import AskCallback
 
 
@@ -161,7 +163,7 @@ class TUIApp:
                 pass
 
 
-async def _run_repl_turn(runner: Any, user_input: str, ask_cb: AskCallback, app: TUIApp) -> None:
+async def _run_repl_turn(runner: Any, user_input: str | Message, ask_cb: AskCallback, app: TUIApp) -> None:
     """Cancel the current turn on SIGINT while keeping the prompt task alive."""
 
     async def consume() -> None:
@@ -250,6 +252,18 @@ async def run_repl(
 
     app = TUIApp(console=active_console)
     ask_cb = make_ask_callback(console=active_console, auto_approve=auto_approve)
+    pending_images: list[str] = []
+    original_ask = ask_cb
+    async def preview_ask(call: ToolCall) -> bool:
+        changes = getattr(runner.tools, 'changes', None)
+        tool = runner.tools.get(call.name)
+        if changes is not None and tool is not None:
+            preview = await changes.preview(tool, call.arguments)
+            if preview:
+                active_console.print(preview, markup=False)
+        decision = original_ask(call)
+        return bool(await decision) if inspect.isawaitable(decision) else bool(decision)
+    ask_cb = preview_ask
 
     while True:
         try:
@@ -299,8 +313,32 @@ async def run_repl(
                 "  /tools - List available tools and danger levels\n"
                 "  /history, /messages - Inspect conversation roles, lengths and tool calls\n"
                 "  /prompt - Show the active system prompt and workspace instructions\n"
+                "  /attach <path> - Attach an image to the next prompt; /attachments clear to discard\n"
+                "  /changes - Preview tracked file changes; /undo - Restore the latest file checkpoint\n"
                 "  Multiline: enter triple quotes on their own line, then close with the same delimiter.\n"
             )
+            continue
+
+        if not multiline and stripped.split(maxsplit=1)[0].lower() == '/attach':
+            raw_path = stripped.partition(' ')[2].strip().strip('"')
+            try:
+                from openagent.attachments import load_images
+                load_images([*pending_images, raw_path], runner.provider)
+                pending_images.append(raw_path)
+                active_console.print(f'Attached {Path(raw_path).name}', markup=False)
+            except Exception as exc:
+                active_console.print(f'Attachment rejected: {exc}', markup=False)
+            continue
+        if not multiline and stripped.lower() == '/attachments clear':
+            pending_images.clear()
+            active_console.print('Attachments cleared.', markup=False)
+            continue
+        if not multiline and stripped.lower() in ('/changes', '/undo'):
+            try:
+                changes = runner.tools.changes
+                active_console.print(changes.undo() if stripped.lower() == '/undo' else changes.describe(), markup=False)
+            except Exception as exc:
+                active_console.print(f'File recovery failed: {exc}', markup=False)
             continue
 
         if not multiline and stripped.split(maxsplit=1)[0].lower() == "/model":
@@ -321,15 +359,31 @@ async def run_repl(
             if same_provider:
                 # Retain the configured gateway, auth headers and custom mappings.
                 target_model = getattr(new_provider, "model", model_ref)
+                new_context = getattr(new_provider, 'context_window', new_provider.default_context_window)
+                new_max = new_provider.default_max_tokens
+                for key in ('supports_vision', 'supports_reasoning'):
+                    if hasattr(new_provider, key):
+                        setattr(old_provider, key, getattr(new_provider, key))
                 await new_provider.close()
                 old_provider.model = target_model
                 runner.model = target_model
+                runner.context_window = getattr(runner, 'explicit_context_window', None) or new_context
+                explicit_max = getattr(runner, 'explicit_max_tokens', None)
+                runner.max_tokens = explicit_max if explicit_max is not None else new_max
+                old_provider.context_window = new_context
+                old_provider.default_max_tokens = new_max
+                from openagent.core.model_metadata import apply_model_metadata
+                for key in ('model_supports_vision', 'model_supports_tools', 'model_supports_reasoning'):
+                    setattr(old_provider, key, None)
+                apply_model_metadata(old_provider)
+                runner.context_window = getattr(runner, 'explicit_context_window', None) or old_provider.context_window
+                runner.max_tokens = explicit_max if explicit_max is not None else old_provider.default_max_tokens
                 active_console.print(f"Model: {runner.model} ({old_provider.name})", markup=False)
                 continue
             explicit_max = getattr(runner, "explicit_max_tokens", None)
             runner.provider = new_provider
             runner.model = getattr(new_provider, "model", model_ref)
-            runner.context_window = getattr(
+            runner.context_window = getattr(runner, 'explicit_context_window', None) or getattr(
                 new_provider, "context_window", new_provider.default_context_window
             )
             runner.max_tokens = (
@@ -360,7 +414,7 @@ async def run_repl(
             continue
 
         if not multiline and stripped.lower() in ("/tokens", "/usage"):
-            usage = app.usage
+            usage = getattr(runner, 'usage', app.usage)
             context_tokens = runner.messages.total_tokens()
             context_window = runner.context_window
             percent = context_tokens / context_window * 100 if context_window else 0
@@ -369,6 +423,8 @@ async def run_repl(
                 f"Context: {context_tokens} / {context_window} tokens ({percent:.1f}%)",
                 markup=False,
             )
+            if hasattr(runner, 'compaction_usage'):
+                active_console.print(f'Compaction: {runner.compaction_usage.total_tokens} | Generation: {runner.generation_usage.total_tokens}', markup=False)
             continue
 
         if not multiline and stripped.lower() == "/tools":
@@ -382,7 +438,12 @@ async def run_repl(
             continue
 
         try:
-            await _run_repl_turn(runner, user_input, ask_cb, app)
+            turn_input: str | Message = user_input
+            if pending_images:
+                from openagent.attachments import load_images
+                turn_input = Message.user(user_input, images=load_images(pending_images, runner.provider))
+                pending_images.clear()
+            await _run_repl_turn(runner, turn_input, ask_cb, app)
         except KeyboardInterrupt:
             active_console.print("\n[yellow]Turn cancelled by user.[/yellow]")
         except Exception as exc:

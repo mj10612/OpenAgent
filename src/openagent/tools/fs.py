@@ -81,7 +81,22 @@ def _atomic_write(target: Path, content: str, overwrite: bool = True) -> None:
             os.replace(temporary, target)
         else:
             # Hard-link publication preserves exclusive-create semantics under races.
-            os.link(temporary, target)
+            try:
+                os.link(temporary, target)
+            except OSError as exc:
+                if exc.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.EPERM, errno.EXDEV) and getattr(exc, "winerror", None) not in (1, 17, 50):
+                    raise
+                # Fallback is exclusive, but readers may observe the copy in progress.
+                with target.open("xb") as output:
+                    try:
+                        with temporary.open("rb") as source:
+                            shutil.copyfileobj(source, output)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    except BaseException:
+                        output.close()
+                        target.unlink(missing_ok=True)
+                        raise
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -242,6 +257,8 @@ class WriteFileTool(BaseFSTool):
             )
 
         try:
+            if len(content.encode("utf-8")) > MAX_FILE_BYTES:
+                raise ValueError("File exceeds 2 MB size limit")
             target.parent.mkdir(parents=True, exist_ok=True)
             _atomic_write(target, content, overwrite=overwrite)
         except Exception as exc:

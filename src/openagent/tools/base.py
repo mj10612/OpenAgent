@@ -8,13 +8,23 @@ from __future__ import annotations
 
 import html
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from openagent.core.types import Message, ToolParam, ToolSpec
 
 DangerLevel = Literal["none", "write", "execute", "network"]
 ToolSource = Literal["builtin", "mcp"]
+MAX_TOOL_OUTPUT_BYTES = 100000
+
+
+def bounded_output(value: str, limit: int = MAX_TOOL_OUTPUT_BYTES) -> str:
+    """Bound stored UTF-8 output without splitting code points."""
+    raw = value.encode("utf-8")
+    marker = "\n[Tool output truncated]"
+    if len(raw) <= limit:
+        return value
+    return raw[:limit - len(marker.encode())].decode("utf-8", errors="ignore") + marker
 
 
 @dataclass(slots=True)
@@ -24,14 +34,18 @@ class ToolResult:
     call_id: str
     output: str
     is_error: bool = False
+    structured_data: Any = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_tool_message(self, name: str | None = None) -> Message:
         """Convert this ToolResult into a canonical tool-role Message."""
         return Message.tool_result(
             call_id=self.call_id,
             name=name or "",
-            content=f"<tool_output>\n{html.escape(self.output)}\n</tool_output>",
+            content=f"<tool_output>\n{bounded_output(html.escape(self.output), MAX_TOOL_OUTPUT_BYTES - 30)}\n</tool_output>",
             is_error=self.is_error,
+            structured_data=self.structured_data,
+            metadata=self.metadata,
         )
 
 

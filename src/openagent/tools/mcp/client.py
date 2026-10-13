@@ -18,21 +18,31 @@ from typing import Any, Literal
 
 import anyio
 import httpx
+import httpx2
 import mcp.types as types
 from mcp.client.session import ClientSession
 from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.client.streamable_http import streamable_http_client
 
 from openagent.core.types import ToolParam
-from openagent.tools.base import DangerLevel, Tool, ToolResult
+from openagent.tools.base import (
+    MAX_TOOL_OUTPUT_BYTES,
+    DangerLevel,
+    Tool,
+    ToolResult,
+    bounded_output,
+)
 
 
 def _transport_failed(exc: BaseException) -> bool:
-    if isinstance(exc, (ConnectionError, OSError, EOFError, anyio.EndOfStream, anyio.BrokenResourceError, anyio.ClosedResourceError, httpx.TransportError)):
+    if isinstance(exc, (ConnectionError, OSError, EOFError, anyio.EndOfStream, anyio.BrokenResourceError, anyio.ClosedResourceError, httpx.TransportError, httpx2.TransportError)):
         return True
     if isinstance(exc, BaseExceptionGroup):
         return any(_transport_failed(child) for child in exc.exceptions)
-    return type(exc).__name__ in ("McpError", "MCPError") and "connection closed" in str(exc).lower()
+    return type(exc).__name__ in ("McpError", "MCPError") and any(
+        marker in str(exc).lower() for marker in ("connection closed", "session terminated", "session expired")
+    )
 
 
 @dataclass(slots=True)
@@ -40,7 +50,7 @@ class MCPServerConfig:
     """Configuration for an MCP server connection."""
 
     name: str
-    transport: Literal["stdio", "sse"] = "stdio"
+    transport: Literal["stdio", "sse", "streamable_http"] = "stdio"
     command: str = ""
     args: list[str] = field(default_factory=list)
     env: dict[str, str] | None = None
@@ -55,9 +65,9 @@ class MCPServerConfig:
         """Create a server configuration from a dictionary."""
         server_name = str(data.get("name") or name)
         transport_raw = str(data.get("transport") or ("sse" if "url" in data and "command" not in data else "stdio")).lower()
-        if transport_raw not in ("stdio", "sse"):
-            raise ValueError(f"Invalid transport: '{transport_raw}'. Expected 'stdio' or 'sse'.")
-        transport: Literal["stdio", "sse"] = "stdio" if transport_raw == "stdio" else "sse"
+        if transport_raw not in ("stdio", "sse", "streamable_http"):
+            raise ValueError(f"Invalid transport: '{transport_raw}'. Expected stdio, sse or streamable_http.")
+        transport: Literal["stdio", "sse", "streamable_http"] = transport_raw  # type: ignore[assignment]
 
         env_raw = data.get("env")
         env_dict = {str(k): str(v) for k, v in env_raw.items()} if env_raw is not None else None
@@ -88,7 +98,7 @@ class MCPServerConfig:
                 result["env"] = dict(self.env)
             if self.cwd is not None:
                 result["cwd"] = str(self.cwd)
-        elif self.transport == "sse":
+        elif self.transport in ("sse", "streamable_http"):
             result["url"] = self.url
             if self.headers is not None:
                 result["headers"] = dict(self.headers)
@@ -194,6 +204,15 @@ class MCPClient:
                     sse_kwargs["sse_read_timeout"] = self.config.read_timeout
                 read_stream, write_stream = await stack.enter_async_context(
                     sse_client(**sse_kwargs)
+                )
+            elif self.config.transport == "streamable_http":
+                http_client = await stack.enter_async_context(httpx2.AsyncClient(
+                    headers=self.config.headers,
+                    timeout=httpx2.Timeout(self.config.timeout, read=self.config.read_timeout or self.config.timeout),
+                    follow_redirects=False,
+                ))
+                read_stream, write_stream = await stack.enter_async_context(
+                    streamable_http_client(self.config.url, http_client=http_client)
                 )
             else:
                 raise ValueError(f"Unsupported transport: {self.config.transport}")
@@ -383,11 +402,10 @@ class MCPTool(Tool):
 
     async def execute(self, call_id: str = "", **kwargs: Any) -> ToolResult:
         """Execute the MCP tool via the underlying MCPClient."""
-        declared = {p.name for p in self.params}
-        arguments = {
-            k: v for k, v in kwargs.items()
-            if k != "call_id" or "call_id" in declared
-        }
+        return await self.execute_arguments(kwargs, call_id)
+
+    async def execute_arguments(self, arguments: dict[str, Any], call_id: str = "") -> ToolResult:
+        """Keep remote arguments separate from the local execution identifier."""
 
         try:
             if self.prepare_callback is not None:
@@ -397,7 +415,7 @@ class MCPTool(Tool):
                 if refreshed is not self:
                     from jsonschema import Draft202012Validator
                     Draft202012Validator(refreshed.spec.schema()).validate(arguments)
-                    return await refreshed.execute(call_id=call_id, **arguments)
+                    return await refreshed.execute_arguments(arguments, call_id)
             res = await self.client.call_tool(self.raw_name, arguments=arguments)
         except Exception as exc:
             return ToolResult(
@@ -414,11 +432,11 @@ class MCPTool(Tool):
         if content and isinstance(content, (list, tuple)):
             for item in content:
                 if isinstance(item, str):
-                    output_parts.append(item)
+                    output_parts.append(bounded_output(item))
                 elif hasattr(item, "text"):
-                    output_parts.append(str(item.text))
+                    output_parts.append(bounded_output(str(item.text)))
                 elif isinstance(item, Mapping) and "text" in item:
-                    output_parts.append(str(item["text"]))
+                    output_parts.append(bounded_output(str(item["text"])))
                 elif hasattr(item, "data"):
                     mime = getattr(item, "mime_type", getattr(item, "mimeType", "binary"))
                     output_parts.append(f"[Binary content: {mime}]")
@@ -426,19 +444,38 @@ class MCPTool(Tool):
                     mime = item.get("mimeType") or item.get("mime_type") or "binary"
                     output_parts.append(f"[Binary content: {mime}]")
                 else:
-                    output_parts.append(str(item))
+                    output_parts.append("[Resource or unsupported content]")
+                if sum(len(part.encode("utf-8")) for part in output_parts) >= MAX_TOOL_OUTPUT_BYTES:
+                    output_parts.append("[Additional content truncated]")
+                    break
 
         output = "\n".join(output_parts)
-        if not output:
-            structured = getattr(res, "structured_content", None)
-            if structured is None and isinstance(res, Mapping):
-                structured = res.get("structured_content")
-            if structured is not None:
-                output = json.dumps(structured)
+        structured = getattr(res, "structured_content", None)
+        if structured is None:
+            structured = getattr(res, "structuredContent", None)
+        if structured is None and isinstance(res, Mapping):
+            structured = res.get("structured_content", res.get("structuredContent"))
+        metadata: dict[str, Any] = {}
+        if structured is not None:
+            pieces: list[str] = []
+            size = 0
+            for piece in json.JSONEncoder(ensure_ascii=False).iterencode(structured):
+                size += len(piece.encode("utf-8"))
+                if size > MAX_TOOL_OUTPUT_BYTES:
+                    metadata["structured_truncated"] = True
+                    structured = None
+                    pieces.append("\n[Structured content truncated]")
+                    break
+                pieces.append(piece)
+            output += ("\n" if output else "") + "".join(pieces)
+        limited = bounded_output(output)
+        if limited != output or "truncated]" in limited:
+            metadata["truncated"] = True
+        output = limited
 
         is_error = bool(
             getattr(res, "is_error", False)
             or getattr(res, "isError", False)
             or (isinstance(res, Mapping) and (res.get("is_error", False) or res.get("isError", False)))
         )
-        return ToolResult(call_id=call_id, output=output, is_error=is_error)
+        return ToolResult(call_id=call_id, output=output, is_error=is_error, structured_data=structured, metadata=metadata)

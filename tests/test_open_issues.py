@@ -234,7 +234,7 @@ async def test_gemini_signed_parts_survive_stream_session_and_replay(tmp_path):
     ]
     chunks = [
         {"candidates": [{"content": {"parts": parts}}]},
-        {"candidates": [{"content": {"parts": [{"thoughtSignature": "last-signature"}]}}]},
+        {"candidates": [{"content": {"parts": [{"thoughtSignature": "last-signature"}]}, "finishReason": "STOP"}]},
     ]
     body = "".join("data: " + json.dumps(chunk) + "\n\n" for chunk in chunks)
     async with httpx.AsyncClient(
@@ -379,7 +379,8 @@ def test_session_append_preserves_previous_bytes_and_recovers_torn_batch(tmp_pat
     recovered.save_messages(sid, loaded)
     assert SessionStore(tmp_path).load_session(sid)[1][0].text == "revised"
     assert recovered.delete_session(sid)
-    assert not list(tmp_path.iterdir())
+    # Lock identity remains stable for other writers waiting across deletion.
+    assert [file.name for file in tmp_path.iterdir()] == [f"{sid}.lock"]
 
 
 @pytest.mark.parametrize("prompt", ["-weird prompt", "check this", "-m gpt-4o", "run"])

@@ -14,13 +14,13 @@ import logging
 import platform
 from collections.abc import Sequence
 from datetime import datetime
-from html import escape
 from pathlib import Path
 from typing import Any
 
 from openagent.core.types import ToolSpec
 from openagent.tools.base import Tool
 from openagent.tools.registry import ToolRegistry
+from openagent.utils.tool_metadata import render_tool_metadata
 
 DEFAULT_ROLE_DESCRIPTION = (
     "You are OpenAgent, an autonomous, highly capable AI software engineering assistant. "
@@ -128,16 +128,7 @@ class PromptBuilder:
 
         lines = ["## Available Tools", ""]
         for spec in specs:
-            lines.append(f"### `{spec.name}`")
-            lines.append("<tool_description>")
-            lines.append(escape(spec.description.strip()))
-            lines.append("</tool_description>")
-            if spec.params:
-                lines.append("Parameters:")
-                for param in spec.params:
-                    req = "required" if param.required else "optional"
-                    desc = f": {escape(param.description)}" if param.description else ""
-                    lines.append(f"  - `{param.name}` ({param.type}, {req}){desc}")
+            lines.append(render_tool_metadata(spec))
             lines.append("")
 
         return "\n".join(lines).strip()
