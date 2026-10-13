@@ -38,7 +38,7 @@ from openagent.core.events import (
     ToolResultEvent,
     UsageEvent,
 )
-from openagent.core.router import ModelReference, ProviderRouter
+from openagent.core.router import ProviderRouter
 from openagent.core.types import ToolCall, Usage
 from openagent.tools.registry import AskCallback
 
@@ -297,6 +297,8 @@ async def run_repl(
                 "  /model [name] - Display or switch the active provider/model\n"
                 "  /tokens, /usage - Show cumulative REPL usage and context utilization\n"
                 "  /tools - List available tools and danger levels\n"
+                "  /history, /messages - Inspect conversation roles, lengths and tool calls\n"
+                "  /prompt - Show the active system prompt and workspace instructions\n"
                 "  Multiline: enter triple quotes on their own line, then close with the same delimiter.\n"
             )
             continue
@@ -312,11 +314,9 @@ async def run_repl(
                 active_console.print(f"Could not switch model: {exc}", markup=False)
                 continue
             old_provider = runner.provider
-            ref = ModelReference.parse(model_ref)
             same_provider = type(new_provider) is type(old_provider) and (
-                ref.provider_hint is None
-                or new_provider.name == old_provider.name
-                or ref.provider_hint == old_provider.name
+                new_provider.name == old_provider.name
+                or (old_provider.name == "openai-compat" and new_provider.name == "openai")
             )
             if same_provider:
                 # Retain the configured gateway, auth headers and custom mappings.
@@ -340,6 +340,23 @@ async def run_repl(
                 await old_provider.close()
             except Exception as exc:
                 active_console.print(f"Previous provider cleanup failed: {exc}", markup=False)
+            continue
+
+        if not multiline and stripped.lower() in ("/history", "/messages"):
+            table = Table(title="Conversation History")
+            for column in ("#", "Role", "Characters", "Tokens", "Tool calls / result"):
+                table.add_column(column)
+            for index, message in enumerate(runner.messages.messages, start=1):
+                status = ", ".join(f"{call.name} ({call.id})" for call in message.tool_calls)
+                if message.role == "tool":
+                    status = f"{message.tool_call_id}: {'error' if message.is_error else 'ok'}"
+                table.add_row(str(index), message.role, str(len(message.text)), str(runner.messages.estimator.estimate_message(message)), Text(status))
+            active_console.print(table)
+            continue
+
+        if not multiline and stripped.lower() == "/prompt":
+            prompt = runner.messages.system_message
+            active_console.print(prompt.text if prompt else "No system prompt.", markup=False)
             continue
 
         if not multiline and stripped.lower() in ("/tokens", "/usage"):

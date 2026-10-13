@@ -11,13 +11,11 @@ from openagent.core.router import ModelReference, ProviderRouter
 from openagent.core.types import (
     ChatRequest,
     Message,
-    TextPart,
     ThinkingPart,
     ToolCall,
     ToolProtocol,
     ToolSpec,
     Usage,
-    iter_text_chunks,
 )
 from openagent.providers.anthropic import AnthropicProvider
 from openagent.providers.custom import CustomJsonPathProvider
@@ -133,12 +131,6 @@ def test_preset_defaults_and_protocol_apply():
     assert payload["max_tokens"] == 123
     assert payload["custom"] is True
     assert p.tool_protocol == ToolProtocol.TEXT
-
-
-@pytest.mark.parametrize("size", [0, -1])
-def test_invalid_text_chunk_size_rejected(size):
-    with pytest.raises(ValueError):
-        next(iter_text_chunks([TextPart("abc")], chunk_size=size))
 
 
 def test_full_nested_tool_schema_survives():

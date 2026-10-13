@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator, Mapping
+from copy import deepcopy
 from typing import Any
 
 import httpx
@@ -121,6 +122,9 @@ class GeminiProvider(ChatProvider):
                 continue
 
             role = "model" if msg.role == "assistant" else "user"
+            if role == "model" and msg.metadata.get("gemini_parts"):
+                contents.append({"role": role, "parts": deepcopy(msg.metadata["gemini_parts"])})
+                continue
             parts: list[dict[str, Any]] = []
 
             if msg.reasoning:
@@ -213,6 +217,7 @@ class GeminiProvider(ChatProvider):
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
             calls: list[ToolCall] = []
+            response_parts: list[dict[str, Any]] = []
             usage = Usage()
             finish_reason = FinishReason.STOP
 
@@ -266,6 +271,10 @@ class GeminiProvider(ChatProvider):
                     content = candidate.get("content") or {}
                     parts = content.get("parts") or []
                     for part in parts:
+                        if set(part) == {"thoughtSignature"} and response_parts:
+                            response_parts[-1]["thoughtSignature"] = part["thoughtSignature"]
+                        else:
+                            response_parts.append(deepcopy(part))
                         if "text" in part:
                             txt = part["text"]
                             if part.get("thought"):
@@ -297,13 +306,13 @@ class GeminiProvider(ChatProvider):
             if calls:
                 finish_reason = FinishReason.TOOL_CALLS
 
+            assistant_message = Message.assistant(
+                "".join(text_parts), tool_calls=calls, reasoning="".join(reasoning_parts) or None,
+            )
+            assistant_message.metadata["gemini_parts"] = response_parts
             yield DoneEvent(
                 finish_reason=finish_reason,
-                message=Message.assistant(
-                    "".join(text_parts),
-                    tool_calls=calls,
-                    reasoning="".join(reasoning_parts) or None,
-                ),
+                message=assistant_message,
                 usage=usage,
             )
         except httpx.HTTPError as exc:

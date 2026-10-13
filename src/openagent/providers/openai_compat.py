@@ -357,6 +357,8 @@ class OpenAICompatProvider(ChatProvider):
                         for raw_call in delta.get("tool_calls") or ():
                             index = int(raw_call.get("index", len(partials)))
                             slot = partials.setdefault(index, {"id": "", "name": "", "args": ""})
+                            if call_id := raw_call.get("id"):
+                                slot["id"] = call_id
 
                             if fn := raw_call.get("function"):
                                 if fn_name := fn.get("name"):
@@ -368,8 +370,6 @@ class OpenAICompatProvider(ChatProvider):
                                 if args_delta := fn.get("arguments"):
                                     slot["args"] += args_delta
                                     yield ToolCallDelta(index=index, arguments_delta=args_delta)
-                            if call_id := raw_call.get("id"):
-                                slot["id"] = call_id
 
                 if codec_stream is not None:
                     text_protocol_calls, remaining_text = codec_stream.finish()

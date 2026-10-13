@@ -444,6 +444,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     i = 0
     while i < len(args_list):
         arg = args_list[i]
+        if arg == "--":
+            if i + 1 < len(args_list):
+                first_positional_idx = i
+            break
         if arg in ("--help", "-h", "--version", "-v"):
             has_subcommand = True
             break

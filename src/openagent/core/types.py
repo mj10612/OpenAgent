@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -280,11 +280,6 @@ class Message:
         )
 
 
-def TextPartText(content: str) -> TextPart:
-    """Factory kept separate so tool results read clearly at call sites."""
-    return TextPart(text=content)
-
-
 def part_to_dict(part: ContentPart) -> dict[str, Any]:
     match part:
         case TextPart(text=t):
@@ -532,39 +527,3 @@ class FinishReason(StrEnum):
     CONTENT_FILTER = "content_filter"
     ERROR = "error"
     UNKNOWN = "unknown"
-
-
-class Permission(StrEnum):
-    """Three-state authorisation for a tool invocation."""
-
-    ALLOW = "allow"
-    ASK = "ask"
-    DENY = "deny"
-
-    @classmethod
-    def parse(cls, value: str | None) -> Permission:
-        match (value or "ask").strip().lower():
-            case "allow" | "always" | "yes" | "y":
-                return cls.ALLOW
-            case "deny" | "no" | "n" | "never":
-                return cls.DENY
-            case _:
-                return cls.ASK
-
-
-def iter_text_chunks(parts: Iterable[ContentPart], *, chunk_size: int = 4000) -> Iterator[str]:
-    """Split text into bounded chunks, never splitting a ``\\n\\n`` paragraph."""
-    if chunk_size <= 0:
-        raise ValueError("chunk_size must be positive")
-    buffer = ""
-    for part in parts:
-        if not isinstance(part, TextPart):
-            continue
-        buffer += part.text
-        while len(buffer) >= chunk_size:
-            split = buffer.rfind("\n\n", 0, chunk_size)
-            cut = split + 2 if split > 0 else chunk_size
-            yield buffer[:cut]
-            buffer = buffer[cut:]
-    if buffer:
-        yield buffer

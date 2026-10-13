@@ -60,7 +60,7 @@ class Compactor:
                     .strip()
                 )
                 if cleaned:
-                    prior_summaries.append(cleaned)
+                    prior_summaries.append(cleaned[:2000])
                 continue
 
             if msg.role == "user":
@@ -192,20 +192,42 @@ class Compactor:
             return [], [m for g in groups for m in g]
 
         split_idx = max(1, len(groups) - self.keep_recent_groups)
-        # All tool iterations following the latest user message belong to the active turn.
         user_groups = [
             i
             for i, group in enumerate(groups)
             if group[0].role == "user" and not group[0].metadata.get("is_summary")
         ]
-        if user_groups:
-            split_idx = min(split_idx, user_groups[-1])
         older_groups = groups[:split_idx]
         recent_groups = groups[split_idx:]
+        # Pin the request, but allow completed tool iterations in its turn to be summarized.
+        if user_groups and user_groups[-1] < split_idx:
+            active_group = groups[user_groups[-1]]
+            older_groups = [group for group in older_groups if group is not active_group]
+            recent_groups.insert(0, active_group)
 
         older = [m for g in older_groups for m in g]
         recent = [m for g in recent_groups for m in g]
         return older, recent
+
+    def _prepare(
+        self, messages: Sequence[Message], max_tokens: int, est: TokenEstimator,
+    ) -> tuple[Message | None, list[Message], list[Message]]:
+        system = messages[0] if messages and messages[0].role == "system" else None
+        older, recent = self._split_turns(messages[1:] if system else messages)
+        if not older:
+            return system, older, recent
+        groups = MessageManager.get_atomic_groups(recent)
+        reserve = min(800, max(12, max_tokens // 4))
+        system_tokens = est.estimate_message(system) if system else 0
+        while system_tokens + est.estimate_messages(recent) + reserve > max_tokens:
+            removable = next((i for i, group in enumerate(groups[:-1]) if group[0].role != "user"), None)
+            if removable is None:
+                break
+            older.extend(groups.pop(removable))
+            recent = [message for group in groups for message in group]
+        if system_tokens + est.estimate_messages(recent) + 12 > max_tokens:
+            raise ValueError("Context budget cannot fit the active request, newest atomic group and summary.")
+        return system, older, recent
 
     def compact_heuristic(
         self,
@@ -220,11 +242,7 @@ class Compactor:
         if total_tokens <= max_tokens or not messages:
             return list(messages)
 
-        has_system = messages[0].role == "system"
-        system_msg = messages[0] if has_system else None
-        conv_messages = messages[1:] if has_system else messages
-
-        older, recent = self._split_turns(conv_messages)
+        system_msg, older, recent = self._prepare(messages, max_tokens, est)
         if not older:
             return list(messages)
         summary_text = self.extract_heuristic_summary(older)
@@ -250,11 +268,7 @@ class Compactor:
         if total_tokens <= max_tokens or not messages:
             return list(messages)
 
-        has_system = messages[0].role == "system"
-        system_msg = messages[0] if has_system else None
-        conv_messages = messages[1:] if has_system else messages
-
-        older, recent = self._split_turns(conv_messages)
+        system_msg, older, recent = self._prepare(messages, max_tokens, est)
         if not older:
             return list(messages)
 
@@ -263,9 +277,9 @@ class Compactor:
                 summary_text = await self.extract_llm_summary(older, provider)
             except Exception as e:
                 logger.warning("LLM summarization failed, falling back to heuristic: %s", e)
-                summary_text = self.extract_heuristic_summary(older)
+                return self.compact_heuristic(messages, max_tokens, estimator=est)
         else:
-            summary_text = self.extract_heuristic_summary(older)
+            return self.compact_heuristic(messages, max_tokens, estimator=est)
 
         summary_msg = Message(
             role=self.summary_role,
@@ -287,20 +301,17 @@ class Compactor:
         result: list[Message] = []
         if system_msg:
             result.append(system_msg)
-        # Never remove the active user message or any subsequent tool iteration.
-        # Windowing can omit the summary from the request when needed; retaining it
-        # in history avoids destroying older context while preserving the active turn.
-        groups = MessageManager.get_atomic_groups(recent)
-        user_groups = [
-            i
-            for i, group in enumerate(groups)
-            if group[0].role == "user" and not group[0].metadata.get("is_summary")
-        ]
-        recent_tokens = est.estimate_messages(recent)
-        overhead = est.estimate_messages(result) + est.estimate_message(summary_msg)
-        if overhead + recent_tokens > max_tokens and user_groups:
-            recent = [message for group in groups[user_groups[-1] :] for message in group]
-            recent_tokens = est.estimate_messages(recent)
+        available = min(800, max_tokens - est.estimate_messages(result + recent))
+        text = summary_msg.text
+        low, high = 0, len(text)
+        while low < high:
+            middle = (low + high + 1) // 2
+            summary_msg.content = [TextPart(text[:middle])]
+            if est.estimate_message(summary_msg) <= available:
+                low = middle
+            else:
+                high = middle - 1
+        summary_msg.content = [TextPart(text[:low])]
         result.append(summary_msg)
         result.extend(recent)
         return result

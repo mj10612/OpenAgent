@@ -8,10 +8,12 @@ Licensed under the Apache License, Version 2.0.
 
 from __future__ import annotations
 
+import errno
 import fnmatch
 import os
 import shutil
 import tempfile
+from functools import cache
 from itertools import islice
 from pathlib import Path
 from typing import Any
@@ -46,6 +48,22 @@ def _walk(root: Path, workspace: Path):
             count += 1
             if count >= MAX_SCAN_ITEMS:
                 return
+
+
+def _glob_matches(path: str, pattern: str) -> bool:
+    """Match complete relative paths; only ** crosses directory boundaries."""
+    parts = tuple(path.split("/"))
+    tokens = tuple(pattern.replace("\\", "/").split("/"))
+
+    @cache
+    def match(i: int, j: int) -> bool:
+        if j == len(tokens):
+            return i == len(parts)
+        if tokens[j] == "**":
+            return match(i, j + 1) or (i < len(parts) and match(i + 1, j))
+        return i < len(parts) and fnmatch.fnmatchcase(parts[i], tokens[j]) and match(i + 1, j + 1)
+
+    return match(0, 0)
 
 
 def _atomic_write(target: Path, content: str, overwrite: bool = True) -> None:
@@ -454,7 +472,7 @@ class GlobFindTool(BaseFSTool):
         try:
             if not pattern or Path(pattern).is_absolute() or ".." in Path(pattern).parts:
                 raise ValueError("Pattern must stay within the search directory")
-            matches = [p for p in _walk(target, self.workspace_root) if p.match(pattern) or fnmatch.fnmatch(str(p.relative_to(target)), pattern)]
+            matches = [p for p in _walk(target, self.workspace_root) if _glob_matches(p.relative_to(target).as_posix(), pattern)]
         except Exception as exc:
             return ToolResult(
                 call_id=call_id,
@@ -546,7 +564,7 @@ class GrepSearchTool(BaseFSTool):
                 data = _read_bounded(f)
                 if b"\x00" in data[:8192]:
                     continue
-                content = data.decode("utf-8")
+                content = data.decode("utf-8", errors="replace")
             except Exception:
                 continue
 
@@ -611,8 +629,32 @@ class MoveFileTool(BaseFSTool):
             if destination.exists():
                 raise FileExistsError("Destination already exists")
             destination.parent.mkdir(parents=True, exist_ok=True)
-            os.link(source, destination)
-            source.unlink()
+            try:
+                os.link(source, destination)
+            except OSError as exc:
+                if exc.errno not in (errno.EXDEV, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EPERM) and getattr(exc, "winerror", None) not in (1, 17, 50):
+                    raise
+                # Exclusive creation preserves the no-overwrite contract across drives.
+                with destination.open("xb") as output:
+                    try:
+                        with source.open("rb") as input_file:
+                            shutil.copyfileobj(input_file, output)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    except BaseException:
+                        output.close()
+                        destination.unlink(missing_ok=True)
+                        raise
+                try:
+                    shutil.copystat(source, destination)
+                except BaseException:
+                    destination.unlink(missing_ok=True)
+                    raise
+            try:
+                source.unlink()
+            except BaseException:
+                destination.unlink(missing_ok=True)
+                raise
             return ToolResult(call_id, "Successfully moved file.")
         except Exception as exc:
             return ToolResult(call_id, str(exc), True)
@@ -620,6 +662,8 @@ class MoveFileTool(BaseFSTool):
 
 def create_fs_tools(workspace_root: Path | str) -> list[Tool]:
     """Create all standard sandboxed filesystem tools bound to the workspace root."""
+    from openagent.tools.patch import ApplyPatchTool
+
     return [
         ReadFileTool(workspace_root),
         WriteFileTool(workspace_root),
@@ -629,4 +673,5 @@ def create_fs_tools(workspace_root: Path | str) -> list[Tool]:
         GrepSearchTool(workspace_root),
         DeleteFileTool(workspace_root),
         MoveFileTool(workspace_root),
+        ApplyPatchTool(workspace_root),
     ]

@@ -11,9 +11,11 @@ import html
 import ipaddress
 import re
 import socket
+import zlib
 from html.parser import HTMLParser
 from typing import Any
 
+import brotli
 import httpx
 
 from openagent.core.types import ToolParam
@@ -175,22 +177,28 @@ class _HTMLTextExtractor(HTMLParser):
         super().__init__()
         self._pieces: list[str] = []
         self._ignore_tags = {"script", "style", "head", "noscript", "svg"}
-        self._current_tag: str | None = None
+        self._ignore_stack: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        self._current_tag = tag.lower()
+        if tag in self._ignore_tags:
+            self._ignore_stack.append(tag)
         if tag in ("p", "br", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li", "tr"):
             self._pieces.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
-        if self._current_tag == tag.lower():
-            self._current_tag = None
+        if tag in self._ignore_stack:
+            index = len(self._ignore_stack) - 1 - self._ignore_stack[::-1].index(tag)
+            del self._ignore_stack[index:]
         if tag in ("p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li", "tr"):
             self._pieces.append("\n")
 
     def handle_data(self, data: str) -> None:
-        if self._current_tag not in self._ignore_tags:
+        if not self._ignore_stack:
             self._pieces.append(data)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
 
     def get_text(self) -> str:
         raw = "".join(self._pieces)
@@ -234,7 +242,7 @@ class WebFetchTool(Tool):
             )
 
         headers = {
-            "Accept-Encoding": "identity",
+            "Accept-Encoding": "gzip, deflate, br, identity",
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 OpenAgent/0.1"
@@ -263,17 +271,36 @@ class WebFetchTool(Tool):
                                 raise ValueError("HTTPS redirects must remain HTTPS")
                             current = target
                             continue
-                        if response.headers.get("content-encoding", "identity").lower() not in ("", "identity"):
-                            raise ValueError("Compressed responses are not supported")
+                        encoding = response.headers.get("content-encoding", "identity").lower()
+                        if encoding not in ("", "identity", "gzip", "deflate", "br"):
+                            raise ValueError(f"Unsupported content encoding: {encoding}")
+                        decoder = zlib.decompressobj(31 if encoding == "gzip" else 15) if encoding in ("gzip", "deflate") else None
+                        brotli_decoder = brotli.Decompressor() if encoding == "br" else None
                         cap = 2 * 1024 * 1024
                         if int(response.headers.get("content-length", "0")) > cap:
                             raise ValueError("Response exceeds 2 MB download limit")
                         body = bytearray()
+                        downloaded = 0
                         async for chunk in response.aiter_raw():
-                            if len(body) + len(chunk) > cap:
+                            downloaded += len(chunk)
+                            if downloaded > cap:
                                 raise ValueError("Response exceeds 2 MB download limit")
-                            body.extend(chunk)
-                        response = httpx.Response(response.status_code, headers=response.headers, content=bytes(body), request=request)
+                            decoded = decoder.decompress(chunk, cap - len(body) + 1) if decoder else chunk
+                            if brotli_decoder:
+                                decoded = brotli_decoder.process(chunk, output_buffer_limit=cap - len(body) + 1)
+                                if not brotli_decoder.can_accept_more_data():
+                                    raise ValueError("Response exceeds 2 MB decompressed limit")
+                            if len(body) + len(decoded) > cap or (decoder and decoder.unconsumed_tail):
+                                raise ValueError("Response exceeds 2 MB decompressed limit")
+                            body.extend(decoded)
+                        if decoder and not decoder.eof:
+                            raise ValueError("Incomplete compressed response")
+                        if brotli_decoder and not brotli_decoder.is_finished():
+                            raise ValueError("Incomplete compressed response")
+                        decoded_headers = dict(response.headers)
+                        decoded_headers.pop("content-encoding", None)
+                        decoded_headers.pop("content-length", None)
+                        response = httpx.Response(response.status_code, headers=decoded_headers, content=bytes(body), request=request)
                         break
                     finally:
                         await streamed_response.aclose()

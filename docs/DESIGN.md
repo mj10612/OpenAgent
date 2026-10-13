@@ -1,263 +1,177 @@
-# OpenAgent 설계 문서
+# OpenAgent implementation design
 
-> 목표: **어떤 모델이든** 쓸 수 있는 터미널 기반 AI Coding Agent.
-> 라이선스: Apache-2.0
+This document describes the implemented architecture. Azure and Bedrock adapters,
+Streamable HTTP MCP, and a web search tool are not implemented. Their identifiers
+must not be interpreted as working native integrations.
 
-## 1. 핵심 원칙
+## Execution flow
 
-### 1.1 "모든 모델 지원"을 가능하게 하는 3중 안전망
+`cli.py` loads configuration, resolves the provider, creates sandboxed tools and
+MCP connections, then constructs `AgentRunner`. `tui/app.py` consumes normalized
+stream events or drives the interactive REPL. The runner owns conversational turns,
+context budgeting, tool dispatch, and session persistence.
 
-모델 지원의 본질적인 문제는 *프로토콜*이지 *모델 목록*이 아니다. 세계의 모든 LLM은 결국
-소수의 프로토콜로 수렴한다. OpenAgent는 계층별로 세 번의 탈출구를 둔다.
+The provider paths are:
 
-| 계층 | 방식 | 새로 지원해야 하는 것 | 커버리지 |
-| --- | --- | --- | --- |
-| L1 | **네이티브 어댑터** | 어댑터 1개 | Anthropic Messages, Google Gemini, Azure OpenAI, AWS Bedrock, Ollama |
-| L2 | **OpenAI 호환 어댑터** | 설정만 | OpenAI, DeepSeek, Groq, xAI, Mistral, Together, Fireworks, OpenRouter, Cerebras, sambanova, vLLM, LM Studio, llama.cpp, NVIDIA NIM, Sakana… (~40곳, 계속 증가) |
-| L3 | **범용 스키마 매핑** | 설정만 | 위 어디에도 해당하지 않는 **임의의 HTTP JSON API**. 환경변수 경로 템플릿 + JSONPath |
+- Native adapters: Anthropic Messages, Gemini Generate Content, and Ollama.
+- OpenAI-compatible gateways: presets select endpoint, credentials, defaults,
+  and tool protocol for `OpenAICompatProvider`.
+- Custom HTTP JSON APIs: `CustomJsonPathProvider` uses configurable JSONPath
+  response mappings. This is an escape hatch, not a separate registry.
 
-> 새 프로토콜이 등장하면 (1) 어댑터를 추가하거나, (2) `custom` 어댑터에 JSONPath 매핑만
-> 적는다. **코드를 한 줄도 바꾸지 않고** 새 API가 지원된다.
+## Implemented modules
 
-### 1.2 도구 호출(Tool Calling) 3단 지원
+Paths below are relative to `src/openagent/`.
 
-가장 많은 모델이 "약한" 지점이 도구 호출이다. 4단으로 격리한다.
+| File | Responsibility |
+| --- | --- |
+| `cli.py` | Argument parsing, run/chat/models/sessions/config commands |
+| `config.py` | Layered TOML, environment and CLI configuration |
+| `runner.py` | Agent turn loop and session transactions |
+| `core/types.py` | Message, content parts, tool schemas, requests and responses |
+| `core/events.py` | Normalized streaming event types |
+| `core/provider.py` | ChatProvider contract and typed provider errors |
+| `core/presets.py` | Provider defaults and credentials |
+| `core/router.py` | ModelReference parsing and ProviderRouter resolution |
+| `providers/openai_compat.py` | OpenAI-compatible streaming adapter |
+| `providers/anthropic.py` | Native Anthropic adapter |
+| `providers/gemini.py` | Native Gemini adapter and signed response Part replay |
+| `providers/ollama.py` | Native Ollama adapter |
+| `providers/custom.py` | Custom JSONPath response adapter |
+| `providers/text_protocol.py` | Text tool-call codec |
+| `context/estimator.py` | Input, output reserve and schema token estimation |
+| `context/messages.py` | History and atomic tool-call/result grouping |
+| `context/compactor.py` | LLM summarization and bounded heuristic fallback |
+| `prompts/base.py` | System instructions, environment and workspace rule loading |
+| `tools/base.py` | Tool interface and ToolResult |
+| `tools/registry.py` | Schema validation, PermissionAction and bounded dispatch |
+| `tools/fs.py` | Sandboxed file operations, glob and text search |
+| `tools/patch.py` | Atomic multi-hunk unified-diff editing |
+| `tools/shell.py` | Bounded subprocess output and process-tree termination |
+| `tools/agent_tools.py` | ThinkTool, TodoTool and WebFetchTool |
+| `tools/mcp/client.py` | MCP stdio/SSE connections and tool adapters |
+| `tools/mcp/manager.py` | Namespaced tools, lifecycle and reconnect preparation |
+| `session/store.py` | JSONL session transactions and recovery |
+| `tui/app.py` | Rich output, approval prompts and REPL |
+| `utils/http.py` | HTTP transport and error mapping |
+| `utils/sse.py` | SSE decoding |
 
-- **T0 — 네이티브**: 프로바이더가 `tools` 필드를 그대로 렌더링하고 tool_call을 파싱한다.
-- **T1 — OpenAI 호환**: `tools` + `tool_calls` JSON 스키마. 요청/응답 필드만 재배치.
-- **T2 — 텍스트 프로토콜**: native tool을 지원하지 않는 모델용. 시스템 프롬프트에
-  도구 사양을 서술하고, 모델이 ```tool_code 블록을 내면 파서가 실행한다.
-- **T3 — 없음**: 도구 없이 순수 프롬프트 모드. 최후의 폴백.
+There is no ProviderRegistry or automatic Normalizer repair stage. Router factory
+branches create providers; tools are registered in ToolRegistry. Prompts live in
+Python rather than a separate assets directory.
 
-에이전트 루프는 도구 호출 방식을 **몰라야 하고**, 프로바이더의 `tool_protocol` 속성만
-보고 분기한다. 새로운 도구 호출 문법이 나오면 프로바이더 하나만 바꾸면 된다.
+## Messages and protocol fidelity
 
-### 1.3 컨텍스트 관리
+`Message.content` is a list of content parts. `ContentPart` is a union alias,
+not a constructible class. Use `Message.user("request")`,
+`Message.assistant("response")`, or `TextPart(text="...")`.
 
-긴 세션에서 무한 컨텍스트는 불가능하므로:
+Providers normalize responses to StreamEvent values. The runner retains the final
+DoneEvent message so vendor metadata survives. Gemini stores original response
+Parts, including thoughtSignature associations, in message metadata and replays
+those Parts when continuing tool calls. Anthropic signed thinking blocks are
+retained as ThinkingPart values. Session serialization preserves this information.
 
-- **토큰 예산**: 프로바이더별 컨텍스트 윈도우 + 예약(reasoning) 분량을 고려해 예산을 계산.
-- **자동 압축(compaction)**: 임계치를 넘으면 LLM이 대화 요약을 생성 → 요약 메시지 1개로 교체.
-- **Sliding window**: 압축 후에도 넘치면 가장 오래된 완전한 턴 단위로 드롭.
-- **경계 정합성**: 턴 경계를 절대 자르지 않는다. 도구 요청/응답 쌍을 쪼개지 않는다.
+An assistant tool-call message and its matching tool-result messages form one
+atomic group. Call IDs must be nonempty and unique before tools execute. Results
+must correspond exactly afterward. Invalid or orphaned groups are never sent to
+providers. Failed or cancelled turns restore prior conversation history; external
+tool side effects cannot be undone by restoring messages.
 
-### 1.4 안전성
+## Context management
 
-- **권한(permission)**: 도구별 allow/ask/deny 3상태. `fs_write`, `shell`는 기본 `ask`.
-- **경로 샌드박스**: 작업 루트를 벗어나는 쓰기/읽기를 차단(심볼릭 링크 해석 후 검증).
-- **Shell 인젝션 방지**: 도구 인자는 shell로 감싸지 않고 배열로 전달.
-- **프롬프트 인젝션 방어**: MCP/웹 콘텐츠는 신뢰 경계 밖 데이터로 마킹하고 시스템 프롬프트에 명시.
-- **시크릿 마스킹**: 로그/트레이스에 API 키 노출 방지.
+The input budget subtracts reserved output tokens, tool schemas and request
+framing from the configured context window. Compaction pins the active user
+request and retains recent complete atomic groups. Earlier completed tool steps,
+including steps in the same user turn, can be summarized. Summaries have a token
+cap and stay pinned during windowing. When the active request and newest atomic
+group cannot fit even with a minimal summary, the runner reports a clear error.
 
-## 2. 아키텍처
+`Compactor.compact` uses LLM summaries when available and calls
+`compact_heuristic` on failure. Previous heuristic summaries are bounded rather
+than nested indefinitely. Token counts are estimates, not vendor tokenizer counts.
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                        CLI  /  TUI                           │
-│              (Rich 기반 REPL, 스트리밍 렌더링)                 │
-└───────────────────────────┬──────────────────────────────────┘
-                            │  사용자 입력 / 이벤트
-┌───────────────────────────▼──────────────────────────────────┐
-│                      AgentRunner                             │
-│  ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌───────────┐  │
-│  │ Prompt     │ │  Context   │ │  Tool      │ │ Session   │  │
-│  │ Builder    │ │ Manager    │ │  Registry  │ │ Store     │  │
-│  │            │ │ (토큰예산/ │ │            │ │           │  │
-│  │ 시스템프롬 │ │  압축/윈도 │ │ builtin+MCP│ │ (JSONL    │  │
-│  │프트 조립   │ │  우 처리)  │ │            │ │  세션저장)│  │
-│  └────────────┘ └────────────┘ └────────────┘ └───────────┘  │
-└──────┬───────────────────────────────┬───────────────────────┘
-       │ CompletionRequest             │ ToolCall
-┌──────▼───────────────────────────────▼───────────────────────┐
-│                   ProviderRouter / Registry                   │
-│  라우팅: model-ref → provider preset → base_url/api_key/params │
-│  지원 범위: native / openai-compatible / custom(JSONPath)     │
-└──────┬───────────────────────────────────────────────────────┘
-       │  단일 chat completions 또는 여러 프로토콜로 분기
-┌──────▼───────────────────────────────────────────────────────┐
-│                  Transport (httpx)  +  SSE 파서              │
-└──────────────────────────────────────────────────────────────┘
-                            │
-                      임의의 LLM API
-```
+## Permissions and tool limits
 
-### 2.1 모듈 레이아웃
+PermissionAction in `tools/registry.py` is the authoritative allow/ask/deny enum.
+Read-only built-ins default to allow; network, write and execute default to ask.
+MCP annotations do not lower execute permissions. Write and execute operations
+are serialized. ToolRegistry runs at most eight workers by default; callers can
+set `max_concurrent_tools` when constructing the registry. Cancellation awaits
+worker cleanup and result ordering follows call ordering.
 
-```
-src/openagent/
-├── core/
-│   ├── types.py        # Message, ToolCall, ToolResult, ChatRequest …
-│   ├── events.py       # 스트리밍 이벤트 유니온
-│   ├── provider.py     # ChatProvider ABC + ProviderRegistry
-│   ├── presets.py      # 내장 프로바이더 프리셋 (40+)
-│   └── router.py       # 모델 레퍼런스 파싱 및 라우팅
-├── context/
-│   ├── estimator.py    # 토큰 추정
-│   ├── messages.py     # 누적/트리밍/경계 정합성
-│   └── compactor.py    # LLM 요약 압축
-├── prompts/
-│   ├── base.py         # 시스템 프롬프트 빌더
-│   └── assets/         # 시스템 프롬프트 텍스트
-├── tools/
-│   ├── base.py         # Tool ABC
-│   ├── registry.py     # 등록 및 실행
-│   ├── fs.py           # read/write/edit/glob/grep/ls
-│   ├── shell.py        # 실행 (배열 전달)
-│   ├── agent_tools.py  # todo, think, webfetch, websearch …
-│   └── mcp/
-│       ├── client.py   # stdio JSON-RPC
-│       ├── http.py     # streamable HTTP / SSE
-│       └── manager.py  # 다중 서버 수명주기
-├── providers/
-│   ├── openai_compat.py
-│   ├── anthropic.py
-│   ├── gemini.py
-│   ├── azure.py
-│   ├── ollama.py
-│   ├── bedrock.py
-│   └── custom.py       # JSONPath 범용 어댑터
-├── session/
-│   └── store.py        # JSONL 영속화, --resume
-├── tui/
-│   └── app.py
-├── config.py
-└── cli.py
-```
+Filesystem paths are resolved under the workspace and checked for containment.
+Search traversal prunes dependency directories and symlinks. `*.py` matches direct
+children; `**/*.py` matches root and nested paths. Unified patches validate every
+hunk before atomic publication and preserve CRLF/LF endings. File moves refuse
+existing destinations and use exclusive copies where hard links are unsupported.
 
-## 3. 핵심 데이터 모델
+WebFetchTool validates and pins public HTTP(S) addresses, rejects unsafe redirects,
+and limits both encoded and decoded bodies to 2 MB. gzip, deflate and Brotli
+responses use bounded streaming decompression. Shell tools still run with the
+process account's filesystem access; workspace path checks are not an OS sandbox.
 
-### 3.1 메시지 (`core/types.py`)
-
-```python
-@dataclass(slots=True)
-class Message:
-    role: Literal["system", "user", "assistant", "tool"]
-    content: list[ContentPart]
-    tool_calls: list[ToolCall]
-    tool_call_id: str | None
-    name: str | None
-```
-
-`content`는 멀티모달 대비 항상 리스트로 통일한다. 텍스트만 쓸 땐
-`ContentPart(text=...)` 한 개. 이렇게 하면 비전 지원 모델로의 업그레이드가
-전면 변경 없이 이루어진다.
-
-### 3.2 스트리밍 이벤트 (`core/events.py`)
-
-```python
-type StreamEvent = StartEvent | TextDelta | ThinkingDelta | ToolCallStart \
-                 | ToolCallDelta | ToolCallEnd | UsageEvent | DoneEvent | ErrorEvent
-```
-
-모든 프로바이더는 자기 네이티브 이벤트를 이 유니온으로 **정규화**한다. TUI와
-에이전트 루프는 프로바이더를 전혀 모른다.
-
-### 3.3 도구 결과 규약
-
-- 성공: `content`에 텍스트, `is_error=False`
-- 실패: 예외를 문자열로 변환해 모델에 전달하되 `is_error=True`.
-  예외로 루프를 죽이지 않는다. 모델이 스스로 오류를 수정하고 재시도하게 한다.
-- 결과 크기 상한: 200KB 초과 시 잘라내고 위치를 명시한다(컨텍스트 폭발 방지).
-
-## 4. Provider 추상화
-
-```python
-class ChatProvider(ABC):
-    name: str
-    tool_protocol: ToolProtocol      # native | json_schema | text | none
-    supports_streaming: bool
-
-    async def stream(self, req: ChatRequest) -> AsyncIterator[StreamEvent]: ...
-    async def list_models(self) -> list[ModelInfo]: ...
-```
-
-`ChatRequest`는 프로바이더 비종속. 어댑터가 `_render_messages()`로 자기 형식으로
-변환한다. **어떤 모델이든 이 한 인터페이스만 구현하면 동작한다.**
-
-## 5. 에이전트 루프
-
-```
-loop:
-  1. 시스템 프롬프트 + 환경 컨텍스트 조립
-  2. 토큰 예산 초과 시 → 압축 → 초과 시 → 슬라이딩 윈도우
-  3. 프로바이더에 ChatRequest 전달, 스트림 수신
-  4. 텍스트/생각은 TUI로 즉시 출력
-  5. tool_calls가 있으면:
-       a. 권한 검사 (allow/ask/deny)
-       b. 병렬 실행 (asyncio.gather, 실패 격리)
-       c. 결과를 tool role 메시지로 추가
-       d. → 2로 복귀
-  6. tool_calls 없으면 → 종료, usage 기록
-```
-
-**핵심 불변식**: `tool_calls`를 만들지 않은 assistant 메시지 뒤에 `tool` role
-메시지가 오면 안 된다. 어댑터가 규약을 어기면 `Normalizer`가 자동 복구한다.
-
-## 6. Provider 결정 흐름
-
-```
-사용자가 "gpt-5" 지정
-  → Router가 알려진 프리셋과 매칭 (정규화: 소문자, 접두/접미 제거)
-  → 없으면 "openai호환 + 기본 base_url"로 폴백 + 경고
-  → 애초에 매칭 안 되면 사용자에게 등록向导 제시
-```
-
-## 7. 설정
-
-`~/.config/openagent/config.toml` (또는 `OPENAGENT_CONFIG`):
+## Configuration example
 
 ```toml
-[models.default]
-provider = "openai-compat"
-model     = "gpt-4o-mini"
-base_url  = "https://api.openai.com/v1"
-api_key   = "sk-..."
+model = "custom/internal-model"
+base_url = "https://gateway.example/v2/generate"
+workspace = "."
+max_tokens = 4096
+context_window = 64000
 
-[models.fast]
-provider = "openai-compat"
-model     = "llama-3.3-70b-versatile"
-base_url  = "https://api.groq.com/openai/v1"
+[custom_provider]
+chat_endpoint = ""
+jsonpath_text = "response.output.text"
+jsonpath_tool_calls = "response.output.actions[*]"
 
-[providers.mygateway]      # 방금 나온 서비스
-kind        = "custom"     # JSONPath 매핑 방식
-base_url    = "https://api.newsvc.ai/v2/chat"
-auth_scheme = "bearer"
-[mappings.newsvc]
-text       = "result.choices[0].message.content"
-tool_calls = "result.choices[0].message.tool_calls[*]"
-usage_in   = "result.usage.prompt_tokens"
+[danger_policy]
+none = "allow"
+network = "ask"
+write = "ask"
+execute = "ask"
+
+[[mcp_servers]]
+name = "local"
+transport = "stdio"
+command = "example-mcp-server"
+args = []
 ```
 
-## 8. 확장 포인트 (기여 포인트)
+Supported MCP transports are `stdio` and `sse`. A remote server uses
+`transport = "sse"` and `url = "https://example.com/sse"`. Arbitrary
+`[providers.mygateway]` tables are not supported; use top-level endpoint settings
+and `[custom_provider]` instead. Paths resolve relative to the containing TOML.
+Credentials should normally come from environment variables.
 
-| 기여 대상 | 파일 | 난이도 |
-| --- | --- | --- |
-| 새 LLM 서비스의 네이티브 어댑터 | `providers/<svc>.py` | 중 |
-| 새 서비스 프리셋 등록 (설정만으로 충분) | `core/presets.py` | 하 |
-| 새 내장 도구 | `tools/<tool>.py` | 하 |
-| MCP 서버 연동 | 설정 `[[mcp_servers]]` | 없음 |
+## Sessions and interactive inspection
 
-## 9. 테스트 전략
+The initial session record and history replacements are written by atomic file
+replacement. Incremental saves append one JSONL batch containing new messages
+and current metadata; readers accept only complete batches, so torn writes do
+not expose partial turns. The store caches previous serialized rows and metadata
+while the file remains unchanged. Compaction or changed prior messages take the
+full rewrite path. Legacy metadata/message rows remain readable.
+Before downgrading, close all agents and use a
+`SessionStore(storage_dir, incremental=False)` to load and save each session with
+its metadata; this exports the original metadata/message-only format without
+dropping message metadata. Old and new agent versions must not concurrently
+write the same session. No existing sessions are converted until a save occurs.
 
-- **단위**: 라우터 모델 레퍼런스 파싱, 토큰 추정, 메시지 트리밍 경계 정합성,
-  JSONPath 매핑, SSE 파서(개행 분할·중단·에러 이벤트).
-- **계측**: `fake` 프로바이더로 전체 루프를 no-network로 검증
-  (tool_call → 실행 → 재요청 → 종료 시나리오).
-- **계약 테스트**: 어댑터 공통 인터페이스 준수 검증.
+The REPL supports /model, /tokens (/usage), /tools, /history (/messages), /prompt,
+/clear, /help and /exit (/quit). Inspection commands do not call the provider.
+Same-provider model changes preserve configured credentials and gateway settings;
+cross-provider changes resolve the target provider independently.
 
-## 10. 로드맵
+## Extension and verification
 
-- [x] Phase 1 — 코어 타입/프로바이더 추상화, 라우터, 프리셋
-- [x] Phase 2 — OpenAI 호환 어댑터 + SSE 스트리밍
-- [x] Phase 3 — 도구 레지스트리 + 파일/셸/에이전트 도구
-- [x] Phase 4 — 컨텍스트 관리(추정/압축/윈도)
-- [x] Phase 5 — 에이전트 루프 + 권한
-- [x] Phase 6 — 세션 영속화
-- [x] Phase 7 — CLI/TUI
-- [x] Phase 8 — MCP 클라이언트 (stdio/HTTP)
-- [x] Phase 9 — Anthropic/Gemini/Azure/Ollama/커스텀 어댑터
-- [ ] Phase 10 — 서브에이전트, 권한 고도화, 관측성
+For an OpenAI-compatible service, add a ProviderPreset in `core/presets.py`.
+For a new protocol, implement ChatProvider in `providers/` and add an instantiation
+branch in `core/router.py`. A native adapter must round-trip tool calls, results
+and vendor reasoning metadata. Register new built-in tools in the relevant
+factory, with an explicit danger level and input schema.
 
-## Implementation status (2026-10-08)
-
-Azure and Bedrock native transports remain planned. Their preset identifiers reject explicitly; they never fall through to an unrelated provider. Current native adapters are Anthropic, Gemini, and Ollama. See README.md and SECURITY.md for current permission, workspace, session and transport guarantees.
+Run `python -m ruff check src tests`, `python -m mypy src tests`,
+`python -m pytest -q`, and `python -m build`. CI checks Windows and Linux with
+Python 3.11, 3.12 and 3.13. Tests use offline mocks; live vendor acceptance still
+requires valid credentials and compatible endpoints.

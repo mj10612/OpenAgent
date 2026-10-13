@@ -211,6 +211,8 @@ openagent chat -m gemini/gemini-2.5-pro -w ./my-project
 #### REPL In-Chat Commands:
 - `/clear`: Clears conversation history and resets context window.
 - `/help`: Displays available commands and keybindings.
+- `/history` or `/messages`: Inspects message roles, lengths, estimated tokens, and tool call/result IDs.
+- `/prompt`: Displays the active system prompt and loaded workspace instructions.
 - `/exit` or `/quit`: Closes the session gracefully.
 
 ### 4. CLI Subcommand Reference
@@ -511,6 +513,13 @@ are never automatically replayed, because they may have had side effects.
 `web_fetch` asks for permission, downloads at most 2 MB, and rejects private or
 loopback destinations, including redirects. Filesystem searches skip common
 repository metadata, dependency directories, large files, and binary files.
+gzip, deflate, and Brotli responses are decompressed incrementally with a 2 MB
+decoded size limit. `apply_patch(path, patch)` accepts unified diffs for existing
+files, validates all hunks before atomic publication, and preserves CRLF/LF endings.
+`glob_find` distinguishes direct-child patterns (`*.py`) from recursive patterns
+(`**/*.py`). File moves fall back to exclusive copies across filesystems.
+Tool batches use at most eight workers by default; library callers can set
+`ToolRegistry(max_concurrent_tools=...)`. Mutating tools remain serialized.
 Shell child processes do not inherit provider credential variables, and stdin
 is closed. An approved shell command still has the process account's filesystem
 access; use an OS sandbox for stronger isolation.
@@ -519,6 +528,10 @@ Configuration paths resolve relative to the containing TOML file. Saved settings
 preserve Unicode and all MCP options. Configuration is written atomically with
 owner-only permissions on POSIX; on Windows it inherits the destination folder
 ACL. Prefer environment variables for secrets (see [SECURITY.md](SECURITY.md)).
+
+Incremental session saves append complete JSONL batches containing new messages
+and current metadata. Compaction and history edits use atomic full replacement.
+Legacy sessions remain readable; incomplete trailing batches are ignored on load.
 
 Azure and Bedrock preset identifiers currently fail explicitly: native Azure
 and AWS signing adapters are not implemented. Use an appropriately configured

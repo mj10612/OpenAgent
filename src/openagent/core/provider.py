@@ -13,7 +13,7 @@ from __future__ import annotations
 import abc
 import json
 from collections.abc import AsyncIterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from .events import StreamEvent
@@ -296,24 +296,4 @@ class ProviderDescriptor:
             "vision": self.vision,
             "reasoning": self.reasoning,
             "doc": self.doc,
-        }
-
-
-@dataclass(slots=True)
-class ProviderHealth:
-    """Result of a lightweight connectivity probe."""
-
-    provider: str
-    ok: bool
-    detail: str = ""
-    models: list[ModelInfo] = field(default_factory=list)
-    latency_ms: float | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "provider": self.provider,
-            "ok": self.ok,
-            "detail": self.detail,
-            "latency_ms": self.latency_ms,
-            "models": [m.id for m in self.models],
         }

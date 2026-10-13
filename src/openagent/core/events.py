@@ -11,7 +11,6 @@ Licensed under the Apache License, Version 2.0.
 from __future__ import annotations
 
 import time
-from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TypeAlias
 
@@ -118,29 +117,3 @@ StreamEvent: TypeAlias = (
     | DoneEvent
     | ErrorEvent
 )
-
-
-def final_message(
-    text: str,
-    *,
-    reasoning: str | None = None,
-    tool_calls: Iterable[ToolCall] | None = None,
-) -> Message:
-    """Build the assistant message implied by a completed stream."""
-    return Message.assistant(text, tool_calls=list(tool_calls or ()), reasoning=reasoning)
-
-
-# Human-readable prefixes used by the TUI. Keeping them here (rather than in the
-# TUI) lets the CLI and tests share identical wording.
-EVENT_LABELS: dict[type, str] = {
-    StartEvent: "start",
-    TextDelta: "text",
-    ThinkingDelta: "thinking",
-    ToolCallStart: "tool-start",
-    ToolCallDelta: "tool-args",
-    ToolCallEnd: "tool-end",
-    ToolResultEvent: "tool-result",
-    UsageEvent: "usage",
-    DoneEvent: "done",
-    ErrorEvent: "error",
-}

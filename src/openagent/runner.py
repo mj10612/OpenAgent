@@ -310,11 +310,13 @@ class AgentRunner:
                 return
 
             # Tool calls present: execute tools concurrently via ToolRegistry
+            expected_ids = [call.id for call in assistant_msg.tool_calls]
+            if not all(expected_ids) or len(set(expected_ids)) != len(expected_ids):
+                raise ValueError("Tool call IDs must be nonempty and unique before execution.")
             tool_results = await self.tools.execute_parallel(
                 assistant_msg.tool_calls,
                 ask_callback=ask_callback,
             )
-            expected_ids = [call.id for call in assistant_msg.tool_calls]
             result_ids = [result.call_id for result in tool_results]
             if (
                 not all(expected_ids)

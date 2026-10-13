@@ -66,12 +66,32 @@ class SessionMetadata:
 class SessionStore:
     """Manages persistence of conversation histories in JSONL format with atomic writes."""
 
-    def __init__(self, storage_dir: str | Path | None = None) -> None:
+    def __init__(self, storage_dir: str | Path | None = None, *, incremental: bool = True) -> None:
+        self.incremental = incremental
         if storage_dir is None or (isinstance(storage_dir, str) and not storage_dir.strip()):
             self._storage_dir = Path.home() / ".openagent" / "sessions"
         else:
             self._storage_dir = Path(storage_dir).expanduser().resolve()
         self._storage_dir.mkdir(parents=True, exist_ok=True)
+        self._cache: dict[str, tuple[SessionMetadata, list[str], tuple[int, int]]] = {}
+
+    def _remember(self, session_id: str, metadata: SessionMetadata, messages: Sequence[Message]) -> None:
+        stat = self._get_session_path(session_id).stat()
+        self._cache[session_id] = (
+            SessionMetadata.from_dict(metadata.to_dict()),
+            [json.dumps(self._serialize_message(message), ensure_ascii=False) for message in messages],
+            (stat.st_size, stat.st_mtime_ns),
+        )
+
+    def _cached(self, session_id: str) -> tuple[SessionMetadata, list[str], tuple[int, int]] | None:
+        cached = self._cache.get(session_id)
+        target = self._get_session_path(session_id)
+        if cached and target.exists():
+            stat = target.stat()
+            if cached[2] == (stat.st_size, stat.st_mtime_ns):
+                return cached
+        self._cache.pop(session_id, None)
+        return None
 
     @property
     def storage_dir(self) -> Path:
@@ -117,11 +137,16 @@ class SessionStore:
                       is updated with new message count and updated timestamp.
         """
         now = time.time()
+        cached = self._cached(session_id)
         if metadata is None:
             target = self._get_session_path(session_id)
             if target.exists():
                 try:
-                    existing_meta, _ = self.load_session(session_id)
+                    if cached:
+                        existing_meta = cached[0]
+                    else:
+                        existing_meta, _ = self.load_session(session_id)
+                        cached = self._cached(session_id)
                     metadata = SessionMetadata(
                         session_id=session_id,
                         created_at=existing_meta.created_at,
@@ -152,7 +177,26 @@ class SessionStore:
             metadata.message_count = len(messages)
             metadata.updated_at = now
 
-        self._atomic_write_session(session_id, metadata, messages)
+        rows = [json.dumps(self._serialize_message(message), ensure_ascii=False) for message in messages]
+        if self.incremental and cached and len(rows) >= len(cached[1]) and rows[:len(cached[1])] == cached[1]:
+            new_rows = rows[len(cached[1]):]
+            if new_rows or metadata.to_dict() != cached[0].to_dict():
+                batch = json.dumps({"type": "batch", "metadata": metadata.to_dict(), "messages": [json.loads(row) for row in new_rows]}, ensure_ascii=False) + "\n"
+                target = self._get_session_path(session_id)
+                original_size = target.stat().st_size
+                try:
+                    with target.open("ab") as output:
+                        output.write(batch.encode("utf-8"))
+                        output.flush()
+                        os.fsync(output.fileno())
+                except BaseException:
+                    self._cache.pop(session_id, None)
+                    with target.open("r+b") as output:
+                        output.truncate(original_size)
+                    raise
+            self._remember(session_id, metadata, messages)
+        else:
+            self._atomic_write_session(session_id, metadata, messages)
 
     def append_message(self, session_id: str, message: Message) -> None:
         """Append a single message to an existing session history atomically.
@@ -164,7 +208,12 @@ class SessionStore:
         Raises:
             FileNotFoundError: If the session does not exist.
         """
-        meta, messages = self.load_session(session_id)
+        cached = self._cached(session_id)
+        if cached:
+            meta = SessionMetadata.from_dict(cached[0].to_dict())
+            messages = [self._deserialize_message(json.loads(row)) for row in cached[1]]
+        else:
+            meta, messages = self.load_session(session_id)
         messages.append(message)
         self.save_messages(session_id, messages, metadata=meta)
 
@@ -185,7 +234,7 @@ class SessionStore:
             raise FileNotFoundError(f"Session '{session_id}' not found at {session_path}")
 
         lines: list[str] = []
-        with open(session_path, encoding="utf-8") as f:
+        with open(session_path, encoding="utf-8", errors="replace") as f:
             for line in f:
                 stripped = line.strip()
                 if stripped:
@@ -211,12 +260,19 @@ class SessionStore:
             title=f"Session {session_id[:8]}",
         )
         messages: list[Message] = []
+        corrupt = False
         for lineno, line in enumerate(lines, start=1):
             try:
                 raw_obj = json.loads(line)
                 if not isinstance(raw_obj, Mapping):
                     raise ValueError("session row must be an object")
-                if raw_obj.get("type") == "metadata" or "session_id" in raw_obj:
+                if raw_obj.get("type") == "batch":
+                    batch_messages = [self._deserialize_message(row) for row in raw_obj["messages"]]
+                    batch_meta = SessionMetadata.from_dict(raw_obj["metadata"])
+                    batch_meta.session_id = session_id
+                    messages.extend(batch_messages)
+                    meta = batch_meta
+                elif raw_obj.get("type") == "metadata" or "session_id" in raw_obj:
                     if lineno != 1:
                         raise ValueError("unexpected metadata row")
                     meta = SessionMetadata.from_dict(raw_obj)
@@ -227,6 +283,7 @@ class SessionStore:
                         raise ValueError("invalid message role")
                     messages.append(message)
             except (TypeError, ValueError, AttributeError, KeyError) as exc:
+                corrupt = True
                 logger.warning("Session %s: skipped corrupt line %d: %s", session_id, lineno, exc)
 
         valid_messages = []
@@ -234,6 +291,7 @@ class SessionStore:
             if MessageManager.valid_tool_group(group):
                 valid_messages.extend(group)
             else:
+                corrupt = True
                 logger.warning(
                     "Session %s: dropped incomplete or invalid tool correspondence (%d messages)",
                     session_id,
@@ -242,6 +300,10 @@ class SessionStore:
         messages = valid_messages
 
         meta.message_count = len(messages)
+        if not corrupt:
+            self._remember(session_id, meta, messages)
+        else:
+            self._cache.pop(session_id, None)
         return meta, messages
 
     def list_sessions(self) -> list[SessionMetadata]:
@@ -272,6 +334,7 @@ class SessionStore:
             True if session file was found and removed, False otherwise.
         """
         session_path = self._get_session_path(session_id)
+        self._cache.pop(session_id, None)
         existed = False
         if session_path.is_file():
             session_path.unlink()
@@ -347,6 +410,7 @@ class SessionStore:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_path, target_path)
+            self._remember(session_id, metadata, messages)
         except Exception:
             if tmp_path.exists():
                 with contextlib.suppress(OSError):

@@ -202,6 +202,15 @@ class MessageManager:
 
         # Partition conversation messages into atomic groups
         groups = self.get_atomic_groups(conv_messages)
+        summaries = [group for group in groups if group[0].metadata.get("is_summary")]
+        if summaries:
+            summary = summaries[-1]
+            remaining_budget -= est.estimate_messages(summary)
+            if remaining_budget <= 0:
+                raise ValueError("Context budget cannot fit the summary and active turn.")
+            groups = [group for group in groups if not group[0].metadata.get("is_summary")]
+        else:
+            summary = []
         selected_groups: list[list[Message]] = []
 
         for group in reversed(groups):
@@ -244,18 +253,10 @@ class MessageManager:
         result: list[Message] = []
         if system_msg:
             result.append(system_msg)
+        result.extend(summary)
         for g in selected_groups:
             result.extend(g)
         return result
-
-    def truncate_to_window(
-        self,
-        max_tokens: int,
-        estimator: TokenEstimator | None = None,
-    ) -> list[Message]:
-        """Apply sliding window in place and return the updated messages."""
-        self._messages = self.window(max_tokens, estimator=estimator)
-        return list(self._messages)
 
     def copy(self) -> MessageManager:
         """Create a deep copy of this MessageManager."""

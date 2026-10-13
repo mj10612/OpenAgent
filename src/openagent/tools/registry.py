@@ -43,6 +43,8 @@ class ToolRegistry:
         self,
         tools: list[Tool] | None = None,
         danger_policies: dict[str, PermissionAction] | None = None,
+        *,
+        max_concurrent_tools: int = 8,
     ) -> None:
         self._tools: dict[str, Tool] = {}
         self._danger_policies: dict[str, PermissionAction] = dict(DEFAULT_DANGER_POLICIES)
@@ -51,6 +53,9 @@ class ToolRegistry:
         self._tool_policies: dict[str, PermissionAction] = {}
         self._mutation_lock = asyncio.Lock()
         self._confirmation_lock = asyncio.Lock()
+        if max_concurrent_tools < 1:
+            raise ValueError("max_concurrent_tools must be positive")
+        self.max_concurrent_tools = max_concurrent_tools
 
         if tools:
             for tool in tools:
@@ -195,5 +200,18 @@ class ToolRegistry:
         ask_callback: AskCallback | None = None,
     ) -> list[ToolResult]:
         """Execute multiple tool calls in parallel with asyncio.gather."""
-        tasks = [self.execute_call(call, ask_callback=ask_callback) for call in calls]
-        return list(await asyncio.gather(*tasks))
+        results: list[ToolResult | None] = [None] * len(calls)
+        pending = iter(enumerate(calls))
+
+        async def worker() -> None:
+            for index, call in pending:
+                results[index] = await self.execute_call(call, ask_callback=ask_callback)
+
+        workers = [asyncio.create_task(worker()) for _ in range(min(len(calls), self.max_concurrent_tools))]
+        try:
+            await asyncio.gather(*workers)
+        finally:
+            for task in workers:
+                task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+        return [result for result in results if result is not None]
