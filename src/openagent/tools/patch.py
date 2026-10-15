@@ -36,8 +36,12 @@ class ApplyPatchTool(BaseFSTool):
             patch = str(kwargs["patch"])
             if len(patch.encode("utf-8")) > MAX_FILE_BYTES:
                 raise ValueError("Patch exceeds 2 MB size limit")
-            lines = original.splitlines(keepends=True)
-            diff = patch.splitlines()
+            lines = original.split("\n")
+            lines = [line + "\n" for line in lines[:-1]] + ([lines[-1]] if lines[-1] else [])
+            diff = patch.split("\n")
+            if diff[-1] == "":
+                diff.pop()
+            diff = [row.removesuffix("\r") for row in diff]
             newline = "\r\n" if "\r\n" in original else "\n"
             output: list[str] = []
             cursor = 0

@@ -158,7 +158,11 @@ class MessageManager:
     @staticmethod
     def valid_tool_group(group: Sequence[Message]) -> bool:
         """Require exactly one result for each uniquely identified tool call."""
+        if not group:
+            return False
         first = group[0]
+        if any(message.tool_calls and message.role != "assistant" for message in group):
+            return False
         if first.role == "tool":
             return False
         if first.role != "assistant" or not first.tool_calls:
@@ -166,7 +170,9 @@ class MessageManager:
         expected = [call.id for call in first.tool_calls]
         actual = [message.tool_call_id for message in group[1:]]
         return (
-            all(expected)
+            all(isinstance(call_id, str) and call_id for call_id in expected)
+            and all(message.role == "tool" for message in group[1:])
+            and all(isinstance(call_id, str) and call_id for call_id in actual)
             and len(set(expected)) == len(expected)
             and len(actual) == len(expected)
             and set(actual) == set(expected)

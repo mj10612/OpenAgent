@@ -433,6 +433,15 @@ class MCPTool(Tool):
             for item in content:
                 if isinstance(item, str):
                     output_parts.append(bounded_output(item))
+                elif getattr(item, "type", None) == "resource" or (isinstance(item, Mapping) and item.get("type") == "resource"):
+                    resource = item.get("resource") if isinstance(item, Mapping) else getattr(item, "resource", None)
+                    def resource_value(key: str, default: Any = "", resource: Any = resource) -> Any:
+                        return resource.get(key, default) if isinstance(resource, Mapping) else getattr(resource, key, default)
+                    uri = bounded_output(str(resource_value("uri")))
+                    mime = bounded_output(str(resource_value("mimeType", resource_value("mime_type", "binary"))))
+                    text = resource_value("text", None)
+                    body = bounded_output(str(text)) if text is not None else "[Blob resource; binary content omitted]"
+                    output_parts.append(bounded_output(f"[Resource: {uri}; {mime}]\n{body}"))
                 elif hasattr(item, "text"):
                     output_parts.append(bounded_output(str(item.text)))
                 elif isinstance(item, Mapping) and "text" in item:

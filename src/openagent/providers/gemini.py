@@ -14,6 +14,7 @@ import json
 from collections.abc import AsyncIterator, Mapping
 from copy import deepcopy
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
 
@@ -171,6 +172,8 @@ class GeminiProvider(ChatProvider):
             payload["system_instruction"] = {"parts": [{"text": system_text}]}
 
         generation_config: dict[str, Any] = {}
+        if request.response_format == "json_object":
+            generation_config["responseMimeType"] = "application/json"
         if request.temperature is not None:
             generation_config["temperature"] = request.temperature
         if request.top_p is not None:
@@ -241,11 +244,17 @@ class GeminiProvider(ChatProvider):
 
                 if "usageMetadata" in chunk:
                     meta = chunk["usageMetadata"]
+                    candidate_tokens = int(
+                        meta.get(
+                            "candidatesTokenCount", usage.completion_tokens - usage.reasoning_tokens
+                        )
+                    )
+                    reasoning_tokens = int(meta.get("thoughtsTokenCount", usage.reasoning_tokens))
                     usage = Usage(
                         prompt_tokens=int(meta.get("promptTokenCount", usage.prompt_tokens)),
-                        completion_tokens=int(
-                            meta.get("candidatesTokenCount", usage.completion_tokens)
-                        ),
+                        completion_tokens=candidate_tokens + reasoning_tokens,
+                        reasoning_tokens=reasoning_tokens,
+                        cached_tokens=int(meta.get("cachedContentTokenCount", usage.cached_tokens)),
                     )
                     yield UsageEvent(usage=usage)
 
@@ -334,8 +343,19 @@ class GeminiProvider(ChatProvider):
             await response.aclose()
 
     async def list_models(self) -> list[ModelInfo]:
-        data = await self._transport.get_json("/models")
-        items = data.get("models", [])
+        items: list[Any] = []
+        cursor = None
+        seen: set[str] = set()
+        while True:
+            path = "/models" + ("?" + urlencode({"pageToken": cursor}) if cursor else "")
+            data = await self._transport.get_json(path)
+            items.extend(data.get("models", []))
+            cursor = data.get("nextPageToken")
+            if not cursor:
+                break
+            if cursor in seen:
+                raise ProviderError("repeated model discovery cursor", provider=self.name)
+            seen.add(cursor)
         return [
             ModelInfo(
                 id=m.get("name", "").removeprefix("models/"),

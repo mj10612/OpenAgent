@@ -353,6 +353,8 @@ class EditFileTool(BaseFSTool):
 
         new_content = content.replace(old_str, new_str, 1)
         try:
+            if len(new_content.encode("utf-8")) > MAX_FILE_BYTES:
+                raise ValueError("Edited file exceeds 2 MB size limit")
             _atomic_write(target, new_content)
         except Exception as exc:
             return ToolResult(

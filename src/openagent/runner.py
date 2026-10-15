@@ -99,6 +99,7 @@ class AgentRunner:
         self.top_p = top_p
         self.workspace_root = workspace_root
         self.extra_instructions = extra_instructions
+        self._turn_active = False
         self._resuming_session = (
             messages is None and session_store is not None and session_id is not None
         )
@@ -147,30 +148,37 @@ class AgentRunner:
         ask_callback: AskCallback | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Execute a transaction, restoring history on errors or interrupted consumption."""
-        self.tools.changes.begin_turn()
-        self._ensure_system_prompt()
-        initial_messages = self.messages.copy().messages
-        initial_session_id = self.session_id
-        completed = False
-        stream = self._run_turn(user_input, ask_callback)
+        if self._turn_active:
+            yield ErrorEvent(RuntimeError("A runner turn is already active"))
+            return
+        self._turn_active = True
         try:
-            async for event in stream:
-                if isinstance(event, ErrorEvent):
-                    self.messages.clear()
-                    self.messages.extend(initial_messages)
-                if isinstance(event, DoneEvent):
-                    completed = True
-                yield event
-        except Exception as exc:
-            self.messages.clear()
-            self.messages.extend(initial_messages)
-            yield ErrorEvent(error=exc)
-        finally:
-            await stream.aclose()
-            if not completed:
+            self.tools.changes.begin_turn()
+            self._ensure_system_prompt()
+            initial_messages = self.messages.copy().messages
+            initial_session_id = self.session_id
+            completed = False
+            stream = self._run_turn(user_input, ask_callback)
+            try:
+                async for event in stream:
+                    if isinstance(event, ErrorEvent):
+                        self.messages.clear()
+                        self.messages.extend(initial_messages)
+                    if isinstance(event, DoneEvent):
+                        completed = True
+                    yield event
+            except Exception as exc:
                 self.messages.clear()
                 self.messages.extend(initial_messages)
-                self.session_id = initial_session_id
+                yield ErrorEvent(error=exc)
+            finally:
+                await stream.aclose()
+                if not completed:
+                    self.messages.clear()
+                    self.messages.extend(initial_messages)
+                    self.session_id = initial_session_id
+        finally:
+            self._turn_active = False
 
     async def _run_turn(
         self,

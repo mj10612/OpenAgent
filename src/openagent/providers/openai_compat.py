@@ -349,10 +349,23 @@ class OpenAICompatProvider(ChatProvider):
                     except json.JSONDecodeError:
                         continue
 
+                    if "error" in chunk:
+                        error = chunk["error"]
+                        message = (
+                            error.get("message", "stream error")
+                            if isinstance(error, dict)
+                            else str(error)
+                        )
+                        raise ProviderError(message, provider=self.name)
+
                     if usage_payload := chunk.get("usage"):
                         usage = _parse_usage(usage_payload)
 
                     for choice in chunk.get("choices") or ():
+                        # The canonical response has one message; retain choice zero
+                        # consistently, including its tool indexes and finish status.
+                        if choice.get("index", 0) != 0:
+                            continue
                         if reason := choice.get("finish_reason"):
                             finish_reason = reason
                             terminal_received = True

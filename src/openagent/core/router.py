@@ -60,6 +60,41 @@ class ProviderRouter:
                 return preset
         return None
 
+    def routing_preset(
+        self, ref: ModelReference, *, base_url: str | None = None
+    ) -> ProviderPreset | None:
+        """Select and validate a preset without creating clients or making requests."""
+        if ref.provider_hint == "custom":
+            return None
+        if ref.provider_hint:
+            preset = self._find_preset(ref.provider_hint)
+            if preset is None and base_url is None:
+                raise ValueError(
+                    f"Unknown provider prefix {ref.provider_hint!r}; configure an explicit base_url"
+                )
+        elif ":" in ref.model_name:
+            preset = self._find_preset("ollama")
+        else:
+            preset = self._find_preset(ref.model_name)
+            model_lower = ref.model_name.lower()
+            if preset is None:
+                preset = next((p for p in self._presets.values() if p.default_model and p.default_model.lower() == model_lower), None)
+            if preset is None:
+                for prefixes, name in (
+                    (("claude",), "anthropic"),
+                    (("gemini",), "gemini"),
+                    (("gpt-", "o1", "o3", "o4", "chatgpt"), "openai"),
+                    (("deepseek",), "deepseek"),
+                ):
+                    if model_lower.startswith(prefixes):
+                        preset = self._find_preset(name)
+                        break
+        if preset is not None and preset.kind in ("azure", "bedrock"):
+            raise ValueError(
+                f"Provider {preset.name!r} is not implemented; use a configured OpenAI-compatible endpoint"
+            )
+        return preset
+
     def resolve(self, model_ref: str | ModelReference, **kwargs: Any) -> ChatProvider:
         from .model_metadata import apply_model_metadata
 
@@ -96,7 +131,7 @@ class ProviderRouter:
 
         # 2. If provider hint matches a known preset
         if ref.provider_hint:
-            preset = self._find_preset(ref.provider_hint)
+            preset = self.routing_preset(ref, base_url=base_url)
             if preset is not None:
                 return self._instantiate_preset(
                     preset,
@@ -132,47 +167,14 @@ class ProviderRouter:
                 **kwargs,
             )
 
-        # 3. No provider hint: check if model_name matches a preset name / alias directly
-        preset = self._find_preset(ref.model_name)
+        # Use the same offline preset selection as readiness diagnostics.
+        preset = self.routing_preset(ref, base_url=base_url)
         if preset is not None:
-            model = preset.default_model or ref.model_name
+            direct = self._find_preset(ref.model_name)
+            model = (preset.default_model or ref.model_name) if direct else ref.model_name
             return self._instantiate_preset(
                 preset,
                 model=model,
-                api_key=api_key,
-                base_url=base_url,
-                extra_headers=extra_headers,
-                **kwargs,
-            )
-
-        # 4. Check if any preset has default_model == ref.model_name
-        model_lower = ref.model_name.lower()
-        for p in self._presets.values():
-            if p.default_model and p.default_model.lower() == model_lower:
-                return self._instantiate_preset(
-                    p,
-                    model=ref.model_name,
-                    api_key=api_key,
-                    base_url=base_url,
-                    extra_headers=extra_headers,
-                    **kwargs,
-                )
-
-        # Route inferred model families through the same preset configuration path.
-        family = None
-        for prefixes, name in (
-            (("claude",), "anthropic"),
-            (("gemini",), "gemini"),
-            (("gpt-", "o1", "o3", "o4", "chatgpt"), "openai"),
-            (("deepseek",), "deepseek"),
-        ):
-            if model_lower.startswith(prefixes):
-                family = self._find_preset(name)
-                break
-        if family is not None:
-            return self._instantiate_preset(
-                family,
-                model=ref.model_name,
                 api_key=api_key,
                 base_url=base_url,
                 extra_headers=extra_headers,

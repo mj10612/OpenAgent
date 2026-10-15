@@ -17,16 +17,23 @@ def diagnose(cfg: OpenAgentConfig) -> list[dict[str, Any]]:
     def add(name: str, status: str, detail: str, required: bool = True) -> None:
         checks.append({'name': name, 'status': status, 'detail': detail, 'required': required})
 
-    ref = ModelReference.parse(cfg.model)
+    model = cfg.model
+    if cfg.custom_provider is not None and not model.startswith(('custom/', 'custom:')):
+        model = f'custom/{model}'
+    ref = ModelReference.parse(model)
     router = ProviderRouter()
-    preset = router._find_preset(ref.provider_hint or ref.model_name)
-    if preset is None:
-        family = 'anthropic' if ref.model_name.startswith('claude') else 'gemini' if ref.model_name.startswith('gemini') else 'ollama' if ':' in ref.model_name else 'openai'
-        preset = router._find_preset(family)
-    custom = cfg.custom_provider is not None or ref.provider_hint == 'custom'
+    try:
+        preset = router.routing_preset(ref, base_url=cfg.base_url)
+    except ValueError as exc:
+        preset = None
+        add('provider', 'error', str(exc))
+    else:
+        add('provider', 'ok', f'Model: {cfg.model}')
+    custom = ref.provider_hint == 'custom'
+    if preset is None and not custom and ref.provider_hint is None:
+        preset = router._find_preset('openai')
     auth = cfg.custom_provider.auth_scheme if cfg.custom_provider else preset.auth.scheme if preset else 'bearer'
-    credential = bool(cfg.api_key or (os.environ.get('CUSTOM_API_KEY') if custom else preset.auth.resolve_key() if preset else os.environ.get('OPENAI_API_KEY')))
-    add('provider', 'ok', f'Model: {cfg.model}')
+    credential = bool(cfg.api_key or (os.environ.get('CUSTOM_API_KEY') if custom else preset.auth.resolve_key() if preset else None))
     add('credential', 'ok' if auth == 'none' or credential else 'error', 'Configured' if credential else 'Not required' if auth == 'none' else 'Required credential missing')
     add('runtime', 'ok', f'Python {sys.version_info.major}.{sys.version_info.minor}')
     shell = shutil.which('powershell' if os.name == 'nt' else 'sh')

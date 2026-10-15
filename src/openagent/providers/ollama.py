@@ -164,6 +164,11 @@ class OllamaProvider(ChatProvider):
             payload["tools"] = [spec.to_openai_schema() for spec in request.tools]
 
         payload.update(self.extra_body)
+        payload["options"] = {
+            **self.extra_body.get("options", {}),
+            **options,
+            "num_ctx": self.context_window,
+        }
         if request.tool_choice == "none":
             payload.pop("tools", None)
             payload.pop("tool_choice", None)

@@ -422,6 +422,8 @@ def save_config(config: OpenAgentConfig, target_path: str | Path) -> None:
         lines.append(f"base_url = {_toml_value(config.base_url)}")
     if config.api_key:
         lines.append(f"api_key = {_toml_value(config.api_key)}")
+    if config.session_id is not None:
+        lines.append(f"session_id = {_toml_value(config.session_id)}")
     if config.temperature is not None:
         lines.append(f"temperature = {config.temperature}")
     if config.top_p is not None:

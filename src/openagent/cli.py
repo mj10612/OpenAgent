@@ -50,6 +50,18 @@ def get_console() -> Console:
     return _console
 
 
+class _ToolPolicyAction(argparse.Action):
+    """Collect repeated policies across the shared root/subparser action."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.values: list[str] = []
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        self.values.append(values)
+        setattr(namespace, self.dest, list(self.values))
+
+
 class _OpenAgentArgumentParser(argparse.ArgumentParser):
     """Custom parser ensuring root default attributes are preserved when using subparsers."""
 
@@ -58,6 +70,9 @@ class _OpenAgentArgumentParser(argparse.ArgumentParser):
         args: Sequence[str] | None = None,
         namespace: argparse.Namespace | None = None,
     ) -> argparse.Namespace:
+        for action in self._actions:
+            if isinstance(action, _ToolPolicyAction):
+                action.values.clear()
         if namespace is None:
             namespace = argparse.Namespace(
                 model=None,
@@ -121,7 +136,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help="Path to custom TOML configuration file",
     )
-    common_parser.add_argument('--tool-policy', action='append', default=argparse.SUPPRESS, metavar='NAME=ACTION', help='Exact tool allow/ask/deny override; repeatable')
+    common_parser.add_argument('--tool-policy', action=_ToolPolicyAction, default=argparse.SUPPRESS, metavar='NAME=ACTION', help='Exact tool allow/ask/deny override; repeatable')
 
     root_parser = _OpenAgentArgumentParser(
         prog="openagent",
@@ -685,6 +700,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         source = 'discovered' if model.context_window is not None or model.max_output is not None else 'heuristic'
                         table.add_row(model.id, str(model.context_window or 'unknown'), str(model.max_output or 'unknown'), str(model.supports_vision), str(model.supports_tools), source)
                     console.print(table)
+                return 0
+            if args.json:
+                _emit_json({'schema_version': 1, 'presets': [_json_data(preset) for _, preset in sorted(all_presets().items())]})
                 return 0
             return _cmd_models(console)
         elif args.subcommand == 'doctor':

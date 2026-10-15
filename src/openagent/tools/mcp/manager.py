@@ -53,6 +53,7 @@ class MCPManager:
         self.failed_servers: dict[str, Exception] = {}
         self._reconnect_locks: dict[str, asyncio.Lock] = {}
         self._retry_after: dict[str, float] = {}
+        self._generations: dict[str, int] = {}
 
     def _wrap(self, client: MCPClient, definition: Any, name: str) -> MCPTool:
         tool = MCPTool(client, definition, server_name=name, name_prefix=self.prefix_tool_names)
@@ -72,10 +73,17 @@ class MCPManager:
                 raise RuntimeError(f"MCP server '{name}' reconnect is temporarily backed off")
             if client is None:
                 return await self.start_server(name)
+            generation = self._generations.get(name, 0)
             try:
                 await client.close()
                 await client.connect()
+                if self._generations.get(name, 0) != generation or self.clients.get(name) is not client:
+                    await _close_owned(client)
+                    return []
                 definitions = await client.list_tools()
+                if self._generations.get(name, 0) != generation or self.clients.get(name) is not client:
+                    await _close_owned(client)
+                    return []
                 wrapped = [self._wrap(client, definition, name) for definition in definitions]
                 old = self.tools.get(name, [])
                 old_names = {tool.name for tool in old}
@@ -122,12 +130,20 @@ class MCPManager:
         if name in self.clients:
             await self.stop_server(name)
 
+        generation = self._generations.get(name, 0) + 1
+        self._generations[name] = generation
         client = self._client_factory(config)
         self.clients[name] = client
         wrapped_tools: list[MCPTool] = []
         try:
             await client.connect()
+            if self._generations.get(name, 0) != generation or self.clients.get(name) is not client:
+                await _close_owned(client)
+                return []
             mcp_tool_defs = await client.list_tools()
+            if self._generations.get(name, 0) != generation or self.clients.get(name) is not client:
+                await _close_owned(client)
+                return []
             for tool_def in mcp_tool_defs:
                 tool = self._wrap(client, tool_def, config.name)
                 self.registry.register(tool)
@@ -143,13 +159,15 @@ class MCPManager:
             logger.warning("Failed to connect to MCP server '%s': %s", name, exc)
             for tool in wrapped_tools:
                 self.registry.unregister(tool.name)
-            self.clients.pop(name, None)
-            with contextlib.suppress(Exception):
-                await _close_owned(client)
+            if self.clients.get(name) is client:
+                self.clients.pop(name, None)
+                with contextlib.suppress(Exception):
+                    await _close_owned(client)
             raise
 
     async def stop_server(self, name: str) -> None:
         """Stop an individual MCP server and unregister its tools."""
+        self._generations[name] = self._generations.get(name, 0) + 1
         registered_tools = self.tools.pop(name, [])
         for tool in registered_tools:
             if self.registry.get(tool.name) is tool:

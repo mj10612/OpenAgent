@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any
+from urllib.parse import urlencode
 
 from ..core.events import (
     DoneEvent,
@@ -416,17 +417,31 @@ class AnthropicProvider(ChatProvider):
             await response.aclose()
 
     async def list_models(self) -> list[ModelInfo]:
-        body = await self._transport.get_json("/v1/models")
+        items: list[Any] = []
+        cursor = None
+        seen: set[str] = set()
+        while True:
+            path = "/v1/models" + ("?" + urlencode({"after_id": cursor}) if cursor else "")
+            body = await self._transport.get_json(path)
+            items.extend(body.get("data") or ())
+            if not body.get("has_more"):
+                break
+            cursor = body.get("last_id")
+            if not cursor or cursor in seen:
+                raise ProviderError(
+                    "invalid or repeated model discovery cursor", provider=self.name
+                )
+            seen.add(cursor)
         return [
             ModelInfo(
                 id=entry.get("id", ""),
                 provider=self.name,
-                context_window=entry.get("context_window"),
-                max_output=entry.get("max_output_tokens"),
+                context_window=entry.get("max_input_tokens", entry.get("context_window")),
+                max_output=entry.get("max_tokens", entry.get("max_output_tokens")),
                 supports_vision=entry.get("vision"),
                 supports_tools=entry.get("tool_calling"),
             )
-            for entry in body.get("data") or ()
+            for entry in items
             if entry.get("id")
         ]
 

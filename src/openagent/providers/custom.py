@@ -258,8 +258,11 @@ class CustomJsonPathProvider(ChatProvider):
             payload["temperature"] = request.temperature
         if request.top_p is not None:
             payload["top_p"] = request.top_p
-        if request.max_tokens is not None:
-            payload["max_tokens"] = request.max_tokens
+        max_tokens = (
+            request.max_tokens if request.max_tokens is not None else self.default_max_tokens
+        )
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
         if request.tools and request.tool_choice != "none":
             payload["tool_choice"] = request.tool_choice
             payload["tools"] = [t.to_openai_schema() for t in request.tools]

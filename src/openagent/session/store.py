@@ -59,10 +59,14 @@ class SessionMetadata:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> SessionMetadata:
         """Construct SessionMetadata from a dictionary."""
+        created_at = float(data.get("created_at", time.time()))
+        updated_at = float(data.get("updated_at", time.time()))
+        if not math.isfinite(created_at) or not math.isfinite(updated_at):
+            raise ValueError("Session timestamps must be finite")
         return cls(
             session_id=str(data.get("session_id", "")),
-            created_at=float(data.get("created_at", time.time())),
-            updated_at=float(data.get("updated_at", time.time())),
+            created_at=created_at,
+            updated_at=updated_at,
             model=str(data.get("model", "")),
             title=str(data.get("title", "")),
             message_count=int(data.get("message_count", 0)),
@@ -400,6 +404,7 @@ class SessionStore:
         meta = SessionMetadata(session_id, created_at=stat.st_ctime, updated_at=stat.st_mtime)
         count = 0
         pending: list[Message] = []
+        invalid_metadata = False
 
         def lightweight(row: Mapping[str, Any]) -> Message:
             message = self._deserialize_message(row)
@@ -427,6 +432,7 @@ class SessionStore:
                 if not line.strip():
                     continue
                 try:
+                    row = None
                     row = json.loads(line)
                     if not isinstance(row, Mapping):
                         raise ValueError("session row must be an object")
@@ -443,7 +449,11 @@ class SessionStore:
                     else:
                         accept(lightweight(row))
                 except (TypeError, ValueError, AttributeError, KeyError):
+                    if isinstance(row, Mapping) and (row.get("type") in {"metadata", "batch"} or "session_id" in row):
+                        invalid_metadata = True
                     logger.warning("Session %s: skipped corrupt line %d", session_id, lineno)
+        if invalid_metadata:
+            raise ValueError("Invalid session age metadata")
         if pending and MessageManager.valid_tool_group(pending):
             count += len(pending)
         meta.session_id = session_id
@@ -468,6 +478,8 @@ class SessionStore:
                 return value
             rows = mask(rows)
             for row in rows:
+                for call in row.get("tool_calls", []):
+                    call["raw_arguments"] = json.dumps(call["arguments"], ensure_ascii=False)
                 if row["role"] == "tool":
                     row["content"] = [{"type": "text", "text": "[REDACTED tool output]"}]
         meta = metadata.to_dict()
@@ -603,7 +615,11 @@ class SessionStore:
                 if not path.exists():
                     continue
                 if cutoff is not None:
-                    metadata = self._load_metadata(path.stem)
+                    try:
+                        metadata = self._load_metadata(path.stem)
+                    except (TypeError, ValueError, AttributeError, KeyError):
+                        logger.warning("Session %s: skipped cleanup with invalid age metadata", path.stem)
+                        continue
                     if metadata.updated_at >= cutoff:
                         continue
                 removed += self._delete_session(path.stem)
@@ -682,6 +698,22 @@ class SessionStore:
         calls = payload.get("tool_calls", [])
         if not isinstance(calls, list) or any(not isinstance(call, Mapping) or not isinstance(call.get("id"), str) or not call.get("id") or not isinstance(call.get("name"), str) or not isinstance(call.get("arguments", {}), (str, Mapping)) for call in calls):
             raise ValueError("invalid tool calls")
+
+        role = payload["role"]
+        if calls and role != "assistant":
+            raise ValueError("tool calls require assistant role")
+        result_id = payload.get("tool_call_id")
+        if role == "tool":
+            if not isinstance(result_id, str) or not result_id:
+                raise ValueError("tool result ID must be a nonempty string")
+        elif result_id is not None:
+            raise ValueError("tool result ID requires tool role")
+        for call in calls:
+            arguments = call.get("arguments", {})
+            if isinstance(arguments, str):
+                parsed = json.loads(arguments)
+                if not isinstance(parsed, Mapping):
+                    raise ValueError("tool arguments must be a JSON object")
 
         msg = Message.from_dict(payload)
         raw_tool_calls = payload.get("tool_calls")
