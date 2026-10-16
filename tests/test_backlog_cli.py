@@ -96,8 +96,31 @@ def test_machine_run_valid_stdout_and_provider_cleanup(monkeypatch, tmp_path, ca
     payloads = [json.loads(line) for line in lines]
     assert payloads[-1]['assistant'] == '한글\n[red]😊'
     assert payloads[-1]['outcome'] == 'success'
+    assert payloads[-1]['finish_reason'] == 'stop'
     assert len(lines) == (1 if mode == '--json' else 3)
     close.assert_awaited_once()
+
+
+@pytest.mark.parametrize('mode', ['--json', '--jsonl'])
+@pytest.mark.parametrize('reason, outcome', [('length', 'incomplete'), ('content_filter', 'filtered')])
+def test_machine_run_preserves_incomplete_finish_reason(monkeypatch, tmp_path, capsys, mode, reason, outcome):
+    from openagent.core.events import DoneEvent, TextDelta
+    from openagent.core.types import FinishReason, Message
+    from openagent.providers.openai_compat import OpenAICompatProvider
+    from openagent.runner import AgentRunner
+
+    runner = AgentRunner(OpenAICompatProvider('https://unused.test', 'gpt-4o'))
+    async def turn(*args, **kwargs):
+        yield TextDelta('partial answer')
+        yield DoneEvent(finish_reason=FinishReason(reason), message=Message.assistant('partial answer'))
+    monkeypatch.setattr(runner, 'run_turn', turn)
+    monkeypatch.setattr('openagent.cli._build_runner', lambda cfg, console: (runner, None))
+
+    assert main(['run', 'hello', mode, '-w', str(tmp_path)]) == 1
+    result = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert result['outcome'] == outcome
+    assert result['finish_reason'] == reason
+    assert result['assistant'] == 'partial answer'
 
 
 @pytest.mark.parametrize('events, expected, code', [('error', 'error', 1), ('limit', 'iteration_limit', 1), ('tool', 'partial_failure', 1), ('cancel', 'cancelled', 130)])
