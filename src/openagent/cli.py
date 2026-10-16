@@ -572,10 +572,12 @@ def _emit_json(value) -> None:
 
 
 def _redact(value, cfg: OpenAgentConfig):
+    credential_suffixes = ('API_KEY', 'ACCESS_TOKEN', 'AUTH_TOKEN')
     secrets = [cfg.api_key] if cfg.api_key else []
-    secrets.extend(v for k, v in os.environ.items() if k.endswith(('API_KEY', 'ACCESS_TOKEN', 'AUTH_TOKEN')) and v)
+    secrets.extend(v for k, v in os.environ.items() if k.endswith(credential_suffixes) and v)
     for server in cfg.mcp_servers:
         secrets.extend((server.headers or {}).values())
+        secrets.extend(v for k, v in (server.env or {}).items() if k.endswith(credential_suffixes) and v)
     def clean(item):
         if isinstance(item, str):
             for secret in secrets:
