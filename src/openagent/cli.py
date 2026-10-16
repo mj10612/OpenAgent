@@ -29,7 +29,7 @@ from openagent.config import OpenAgentConfig, get_config_locations, load_config
 from openagent.core.events import DoneEvent, ErrorEvent, TextDelta, ToolResultEvent
 from openagent.core.presets import all_presets
 from openagent.core.router import ProviderRouter
-from openagent.core.types import Message, Usage
+from openagent.core.types import FinishReason, Message, Usage
 from openagent.runner import AgentRunner
 from openagent.session.store import SessionStore
 from openagent.tools.agent_tools import ThinkTool, TodoTool, WebFetchTool
@@ -494,6 +494,7 @@ async def _async_run(args: argparse.Namespace, console: Console) -> int:
             final_usage = Usage()
             outcome = 'success'
             completed = False
+            finish_reason = None
             sequence = 0
             try:
                 async for event in runner.run_turn(prompt, ask_callback=ask_cb):
@@ -506,9 +507,15 @@ async def _async_run(args: argparse.Namespace, console: Console) -> int:
                         assistant += event.text
                     if isinstance(event, DoneEvent):
                         completed = True
+                        finish_reason = event.finish_reason.value
                         final_usage = final_usage + event.usage
                         if event.message:
                             assistant = event.message.text
+                        if event.finish_reason != FinishReason.STOP and not failed:
+                            failed = True
+                            outcome = ('filtered' if event.finish_reason == FinishReason.CONTENT_FILTER
+                                       else 'incomplete')
+                            errors.append(f'Provider finished with {finish_reason}')
                     if isinstance(event, ErrorEvent):
                         failed = True
                         errors.append(str(event.error))
@@ -532,7 +539,8 @@ async def _async_run(args: argparse.Namespace, console: Console) -> int:
             if machine:
                 usage = getattr(runner, 'usage', final_usage)
                 result = {'schema_version': 1, 'type': 'result', 'outcome': outcome, 'exit_code': code,
-                          'assistant': assistant, 'usage': _json_data(usage), 'model': runner.model,
+                          'finish_reason': finish_reason, 'assistant': assistant,
+                          'usage': _json_data(usage), 'model': runner.model,
                           'session': runner.session_id, 'changes': runner.tools.changes.describe(), 'errors': errors}
                 if getattr(args, 'jsonl', False):
                     result['sequence'] = sequence + 1

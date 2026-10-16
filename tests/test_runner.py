@@ -173,6 +173,18 @@ async def test_runner_run_turn_to_completion() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('reason', [FinishReason.LENGTH, FinishReason.CONTENT_FILTER])
+async def test_runner_completion_rejects_partial_provider_response(reason: FinishReason) -> None:
+    provider = MockChatProvider(turns=[[
+        TextDelta(text="Partial answer."),
+        DoneEvent(finish_reason=reason, message=Message.assistant("Partial answer.")),
+    ]])
+    runner = AgentRunner(provider=provider)
+    with pytest.raises(RuntimeError, match=reason.value):
+        await runner.run_turn_to_completion("Hello")
+
+
+@pytest.mark.asyncio
 async def test_runner_multi_step_tool_loop() -> None:
     tools = ToolRegistry([AddTool()])
 

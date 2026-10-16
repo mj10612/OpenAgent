@@ -388,11 +388,14 @@ class AgentRunner:
         text_chunks: list[str] = []
         done_text: str = ""
         error: BaseException | None = None
+        finish_reason: FinishReason | None = None
         async for event in self.run_turn(user_input, ask_callback=ask_callback):
             if isinstance(event, TextDelta):
                 text_chunks.append(event.text)
-            elif isinstance(event, DoneEvent) and event.message and event.message.text:
-                done_text = event.message.text
+            elif isinstance(event, DoneEvent):
+                finish_reason = event.finish_reason
+                if event.message and event.message.text:
+                    done_text = event.message.text
             elif isinstance(event, ErrorEvent):
                 error = (
                     event.error
@@ -402,6 +405,8 @@ class AgentRunner:
 
         if error is not None:
             raise error
+        if finish_reason != FinishReason.STOP:
+            raise RuntimeError(f"Turn did not complete: {finish_reason.value if finish_reason else 'no terminal response'}")
 
         if done_text.strip():
             return done_text
