@@ -28,6 +28,11 @@ class ApplyPatchTool(BaseFSTool):
             ),
         ]
 
+    def preflight(self, **kwargs: Any) -> None:
+        if len(str(kwargs.get("patch", "")).encode("utf-8")) > MAX_FILE_BYTES:
+            raise ValueError("Patch exceeds 2 MB size limit")
+        self._preflight_text_file(kwargs.get("path", ""))
+
     async def execute(self, **kwargs: Any) -> ToolResult:
         call_id = str(kwargs.get("call_id", ""))
         try:

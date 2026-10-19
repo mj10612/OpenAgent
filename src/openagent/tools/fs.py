@@ -133,6 +133,13 @@ class BaseFSTool(Tool):
     def preflight(self, **kwargs: Any) -> None:
         """Check cheap write preconditions before reserving checkpoint storage."""
 
+    def _preflight_text_file(self, path: str | Path) -> None:
+        target = self._resolve(path)
+        if not target.is_file():
+            raise ValueError("Path is not a regular file")
+        if target.stat().st_size > MAX_FILE_BYTES:
+            raise ValueError("File exceeds 2 MB size limit")
+
 
 class ReadFileTool(BaseFSTool):
     """Tool to read files with 1-indexed line viewing."""
@@ -302,6 +309,11 @@ class EditFileTool(BaseFSTool):
             ),
             ToolParam(name="new_str", type="string", description="Replacement text"),
         ]
+
+    def preflight(self, **kwargs: Any) -> None:
+        if not kwargs.get("old_str"):
+            raise ValueError("Parameter 'old_str' cannot be empty.")
+        self._preflight_text_file(kwargs.get("path", ""))
 
     async def execute(self, **kwargs: Any) -> ToolResult:
         call_id = str(kwargs.get("call_id", ""))

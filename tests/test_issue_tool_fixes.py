@@ -216,7 +216,7 @@ async def test_disk_checkpoint_evicts_old_turn_and_closes_backup(tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('failure', ['destination_exists', 'missing_source', 'overwrite_denied', 'oversized_content'])
+@pytest.mark.parametrize('failure', ['destination_exists', 'missing_source', 'overwrite_denied', 'oversized_content', 'oversized_edit_target', 'oversized_patch_target'])
 async def test_failed_preconditions_preserve_disk_undo(tmp_path, failure):
     original = b'x' * (MAX_FILE_BYTES + 1)
     for name in ('deleted', 'source'):
@@ -235,8 +235,12 @@ async def test_failed_preconditions_preserve_disk_undo(tmp_path, failure):
         call = ToolCall(name='move_file', arguments={'source': 'missing', 'destination': 'source'})
     elif failure == 'overwrite_denied':
         call = ToolCall(name='write_file', arguments={'path': 'source', 'content': 'new', 'overwrite': False})
-    else:
+    elif failure == 'oversized_content':
         call = ToolCall(name='write_file', arguments={'path': 'source', 'content': 'y' * (MAX_FILE_BYTES + 1)})
+    elif failure == 'oversized_edit_target':
+        call = ToolCall(name='edit_file', arguments={'path': 'source', 'old_str': 'x', 'new_str': 'y'})
+    else:
+        call = ToolCall(name='apply_patch', arguments={'path': 'source', 'patch': '@@ -1 +1 @@\n-x\n+y\n'})
     failed = await registry.execute_call(call)
     assert failed.is_error
     assert not backup.closed
