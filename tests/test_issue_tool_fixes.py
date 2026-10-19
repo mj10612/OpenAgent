@@ -216,6 +216,39 @@ async def test_disk_checkpoint_evicts_old_turn_and_closes_backup(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['destination_exists', 'missing_source', 'overwrite_denied', 'oversized_content'])
+async def test_failed_preconditions_preserve_disk_undo(tmp_path, failure):
+    original = b'x' * (MAX_FILE_BYTES + 1)
+    for name in ('deleted', 'source'):
+        (tmp_path / name).write_bytes(original)
+    (tmp_path / 'existing').write_text('keep')
+    registry = ToolRegistry(create_fs_tools(tmp_path), danger_policies={'write': 'allow'})
+    registry.changes.max_disk_bytes = len(original)
+    deleted = await registry.execute_call(ToolCall(name='delete_file', arguments={'path': 'deleted'}))
+    assert not deleted.is_error
+    entry = registry.changes.turns[0][0]
+    backup = next(iter(entry['before'].values())).backup
+    registry.changes.begin_turn()
+    if failure == 'destination_exists':
+        call = ToolCall(name='move_file', arguments={'source': 'source', 'destination': 'existing'})
+    elif failure == 'missing_source':
+        call = ToolCall(name='move_file', arguments={'source': 'missing', 'destination': 'source'})
+    elif failure == 'overwrite_denied':
+        call = ToolCall(name='write_file', arguments={'path': 'source', 'content': 'new', 'overwrite': False})
+    else:
+        call = ToolCall(name='write_file', arguments={'path': 'source', 'content': 'y' * (MAX_FILE_BYTES + 1)})
+    failed = await registry.execute_call(call)
+    assert failed.is_error
+    assert not backup.closed
+    assert registry.changes.turns[0][0] is entry
+    assert registry.changes._retained_disk_bytes() <= registry.changes.max_disk_bytes
+    registry.changes.undo()
+    assert (tmp_path / 'deleted').read_bytes() == original
+    assert (tmp_path / 'source').read_bytes() == original
+    assert (tmp_path / 'existing').read_text() == 'keep'
+
+
+@pytest.mark.asyncio
 async def test_failed_after_capture_and_rollback_never_overwrites_external_edit(tmp_path, monkeypatch):
     tracker = ChangeTracker()
     tool = WriteFileTool(tmp_path)
