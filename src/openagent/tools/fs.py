@@ -130,6 +130,16 @@ class BaseFSTool(Tool):
     def _resolve(self, path: str | Path) -> Path:
         return resolve_sandboxed_path(self.workspace_root, path)
 
+    def preflight(self, **kwargs: Any) -> None:
+        """Check cheap write preconditions before reserving checkpoint storage."""
+
+    def _preflight_text_file(self, path: str | Path) -> None:
+        target = self._resolve(path)
+        if not target.is_file():
+            raise ValueError("Path is not a regular file")
+        if target.stat().st_size > MAX_FILE_BYTES:
+            raise ValueError("File exceeds 2 MB size limit")
+
 
 class ReadFileTool(BaseFSTool):
     """Tool to read files with 1-indexed line viewing."""
@@ -229,6 +239,21 @@ class WriteFileTool(BaseFSTool):
             ),
         ]
 
+    @staticmethod
+    def _validate_target(target: Path, path: str, content: str, overwrite: bool) -> None:
+        if target.exists() and not overwrite:
+            raise FileExistsError(f"File already exists: '{path}'. Set overwrite=True to overwrite.")
+        if target.is_dir():
+            raise ValueError(f"Target path '{path}' is a directory.")
+        if len(content.encode("utf-8")) > MAX_FILE_BYTES:
+            raise ValueError("File exceeds 2 MB size limit")
+
+    def preflight(self, **kwargs: Any) -> None:
+        path = str(kwargs.get("path", ""))
+        if not path:
+            raise ValueError("Parameter 'path' is required.")
+        self._validate_target(self._resolve(path), path, str(kwargs.get("content", "")), bool(kwargs.get("overwrite", True)))
+
     async def execute(self, **kwargs: Any) -> ToolResult:
         call_id = str(kwargs.get("call_id", ""))
         path = str(kwargs.get("path", ""))
@@ -243,22 +268,12 @@ class WriteFileTool(BaseFSTool):
         except PermissionError as exc:
             return ToolResult(call_id=call_id, output=str(exc), is_error=True)
 
-        if target.exists() and not overwrite:
-            return ToolResult(
-                call_id=call_id,
-                output=f"File already exists: '{path}'. Set overwrite=True to overwrite.",
-                is_error=True,
-            )
-        if target.is_dir():
-            return ToolResult(
-                call_id=call_id,
-                output=f"Target path '{path}' is a directory.",
-                is_error=True,
-            )
+        try:
+            self._validate_target(target, path, content, overwrite)
+        except (ValueError, FileExistsError) as exc:
+            return ToolResult(call_id=call_id, output=str(exc), is_error=True)
 
         try:
-            if len(content.encode("utf-8")) > MAX_FILE_BYTES:
-                raise ValueError("File exceeds 2 MB size limit")
             target.parent.mkdir(parents=True, exist_ok=True)
             _atomic_write(target, content, overwrite=overwrite)
         except Exception as exc:
@@ -294,6 +309,11 @@ class EditFileTool(BaseFSTool):
             ),
             ToolParam(name="new_str", type="string", description="Replacement text"),
         ]
+
+    def preflight(self, **kwargs: Any) -> None:
+        if not kwargs.get("old_str"):
+            raise ValueError("Parameter 'old_str' cannot be empty.")
+        self._preflight_text_file(kwargs.get("path", ""))
 
     async def execute(self, **kwargs: Any) -> ToolResult:
         call_id = str(kwargs.get("call_id", ""))
@@ -638,15 +658,22 @@ class MoveFileTool(BaseFSTool):
         super().__init__(workspace_root)
         self.params = [ToolParam(name="source", type="string", description="Source file"), ToolParam(name="destination", type="string", description="Destination file")]
 
+    @staticmethod
+    def _validate_paths(source: Path, destination: Path) -> None:
+        if not source.is_file():
+            raise ValueError("Source is not a regular file")
+        if destination.exists():
+            raise FileExistsError("Destination already exists")
+
+    def preflight(self, **kwargs: Any) -> None:
+        self._validate_paths(self._resolve(kwargs.get("source", "")), self._resolve(kwargs.get("destination", "")))
+
     async def execute(self, **kwargs: Any) -> ToolResult:
         call_id = str(kwargs.get("call_id", ""))
         try:
             source = self._resolve(kwargs.get("source", ""))
             destination = self._resolve(kwargs.get("destination", ""))
-            if not source.is_file():
-                raise ValueError("Source is not a regular file")
-            if destination.exists():
-                raise FileExistsError("Destination already exists")
+            self._validate_paths(source, destination)
             destination.parent.mkdir(parents=True, exist_ok=True)
             try:
                 os.link(source, destination)

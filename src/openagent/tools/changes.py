@@ -87,6 +87,8 @@ class ChangeTracker:
     def capture(self, tool: Any, arguments: dict[str, Any]) -> dict[Path, FileState]:
         if not self.enabled:
             return {}
+        if isinstance(tool, BaseFSTool) and tool.danger == "write":
+            tool.preflight(**arguments)
         paths = self._paths(tool, arguments)
         disk_needed = sum(path.stat().st_size for path in paths if path.is_file() and path.stat().st_size > MAX_FILE_BYTES)
         if disk_needed > self.max_disk_bytes:
