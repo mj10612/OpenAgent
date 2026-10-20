@@ -55,3 +55,50 @@ def test_config_preserves_resume_target(tmp_path, monkeypatch):
     path = tmp_path / 'config.toml'
     save_config(OpenAgentConfig(session_id='resume-me'), path)
     assert load_config(path).session_id == 'resume-me'
+
+
+@pytest.mark.parametrize('key', ['API_KEY', 'SERVICE_API_KEY', 'ACCESS_TOKEN', 'AUTH_TOKEN'])
+def test_machine_redacts_mcp_env_credentials(key):
+    from openagent.cli import _redact
+    from openagent.tools.mcp.client import MCPServerConfig
+
+    cfg = OpenAgentConfig(mcp_servers=[MCPServerConfig(
+        name='fixture', command='fake',
+        env={key: 'fake-mcp-credential', 'MODE': 'development', 'EMPTY_API_KEY': ''},
+    )])
+    payload = {'events': [{'output': 'failed fake-mcp-credential'}], 'mode': 'development'}
+    assert _redact(payload, cfg) == {
+        'events': [{'output': 'failed [REDACTED]'}], 'mode': 'development',
+    }
+
+
+@pytest.mark.parametrize('mode', ['--json', '--jsonl'])
+def test_machine_output_masks_mcp_env_credentials_in_errors(mode, monkeypatch, capsys):
+    from openagent.core.events import ErrorEvent, TextDelta, ToolResultEvent
+    from openagent.providers.openai_compat import OpenAICompatProvider
+    from openagent.runner import AgentRunner
+    from openagent.tools.mcp.client import MCPServerConfig
+
+    credential = 'fake-mcp-env-token'
+    cfg = OpenAgentConfig(mcp_servers=[MCPServerConfig(
+        name='fixture', command='fake', env={'SERVICE_API_KEY': credential},
+    )])
+    provider = OpenAICompatProvider('https://unused.test', 'gpt-4o')
+    runner = AgentRunner(provider)
+
+    async def turn(*args, **kwargs):
+        yield TextDelta(f'diagnostic {credential}')
+        yield ToolResultEvent('call', 'fixture__tool', f'failed {credential}', is_error=True)
+        yield ErrorEvent(RuntimeError(f'server error {credential}'))
+
+    monkeypatch.setattr(runner, 'run_turn', turn)
+    monkeypatch.setattr('openagent.cli._load_args_config', lambda args: cfg)
+    monkeypatch.setattr('openagent.cli._build_runner', lambda cfg, console: (runner, None))
+    assert main(['run', 'fixture', mode]) == 1
+    output = capsys.readouterr().out
+    assert credential not in output
+    rows = [json.loads(line) for line in output.splitlines()]
+    assert rows[-1]['errors'][-1] == 'server error [REDACTED]'
+    assert rows[-1]['assistant'] == 'diagnostic [REDACTED]'
+    if mode == '--jsonl':
+        assert next(row for row in rows if row['type'] == 'ToolResultEvent')['event']['output'] == 'failed [REDACTED]'
