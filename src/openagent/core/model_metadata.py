@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import math
 import os
+import tempfile
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -13,6 +16,26 @@ from .provider import ChatProvider, ProviderError
 from .types import ModelInfo
 
 DEFAULT_TTL = 3600.0
+logger = logging.getLogger(__name__)
+
+
+def _valid_model(model: ModelInfo) -> bool:
+    return (
+        isinstance(model.id, str)
+        and bool(model.id)
+        and isinstance(model.provider, str)
+        and bool(model.provider)
+        and all(
+            value is None or (type(value) is int and value > 0)
+            for value in (model.context_window, model.max_output)
+        )
+        and all(
+            value is None or type(value) is bool
+            for value in (model.supports_tools, model.supports_vision, model.supports_reasoning)
+        )
+        and isinstance(model.aliases, list)
+        and all(isinstance(alias, str) for alias in model.aliases)
+    )
 
 
 def _cache_path(provider: ChatProvider, cache_path: Path | None = None) -> Path:
@@ -31,9 +54,15 @@ def cached_models(
 ) -> list[ModelInfo] | None:
     try:
         data = json.loads(_cache_path(provider, cache_path).read_text(encoding="utf-8"))
-        if time.time() - data["updated"] > ttl:
+        updated = data["updated"]
+        if type(updated) not in (int, float) or not math.isfinite(updated):
             return None
-        return [ModelInfo(**item) for item in data["models"]]
+        if time.time() - updated > ttl:
+            return None
+        if not isinstance(data["models"], list):
+            return None
+        models = [ModelInfo(**item) for item in data["models"]]
+        return models if all(_valid_model(model) for model in models) else None
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
@@ -53,16 +82,36 @@ async def discover_models(
     if type(provider).list_models is ChatProvider.list_models or provider.name == "custom":
         raise ProviderError("model discovery is unsupported", provider=provider.name)
     models = await provider.list_models()
+    if not isinstance(models, list) or not all(
+        isinstance(model, ModelInfo) and _valid_model(model) for model in models
+    ):
+        raise ProviderError("model discovery returned invalid metadata", provider=provider.name)
     path = _cache_path(provider, cache_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Only allowlisted ModelInfo fields; never persist transports or credentials.
-    path.write_text(
-        json.dumps(
-            {"updated": time.time(), "models": [asdict(model) for model in models]},
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
+    temporary_path: str | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Only allowlisted ModelInfo fields; never persist transports or credentials.
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.",
+            delete=False,
+        ) as temporary:
+            temporary_path = temporary.name
+            json.dump(
+                {"updated": time.time(), "models": [asdict(model) for model in models]},
+                temporary,
+                ensure_ascii=False,
+            )
+        os.replace(temporary_path, path)
+    except OSError as exc:
+        logger.warning("Could not save model discovery cache: %s", exc)
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.warning("Could not remove temporary model cache: %s", exc)
     return models
 
 
