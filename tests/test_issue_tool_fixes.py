@@ -172,6 +172,42 @@ async def test_patch_preserves_crlf_and_no_final_newline(tmp_path, ending):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("patch", [
+    "@@ -1 +1 @@\n-old\n+new\n\\ No newline at end of file\n",
+    "@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n",
+    "@@ -1 +1 @@\n old\n\\ No newline at end of file\n",
+])
+async def test_patch_rejects_interior_eof_markers_atomically(tmp_path, patch):
+    target = tmp_path / "a"
+    target.write_bytes(b"old\ntail\n")
+    result = await ApplyPatchTool(tmp_path).execute(path="a", patch=patch)
+    assert result.is_error
+    assert target.read_bytes() == b"old\ntail\n"
+
+
+@pytest.mark.asyncio
+async def test_patch_rejects_missing_source_eof_marker(tmp_path):
+    target = tmp_path / "a"
+    target.write_bytes(b"old")
+    result = await ApplyPatchTool(tmp_path).execute(
+        path="a", patch="@@ -1 +1 @@\n-old\n+new\n\\ No newline at end of file\n"
+    )
+    assert result.is_error
+    assert target.read_bytes() == b"old"
+
+
+@pytest.mark.asyncio
+async def test_patch_accepts_final_output_eof_marker(tmp_path):
+    target = tmp_path / "a"
+    target.write_bytes(b"old\n")
+    result = await ApplyPatchTool(tmp_path).execute(
+        path="a", patch="@@ -1 +1 @@\n-old\n+new\n\\ No newline at end of file\n"
+    )
+    assert not result.is_error, result.output
+    assert target.read_bytes() == b"new"
+
+
+@pytest.mark.asyncio
 async def test_direct_oversized_edit_rejects_before_publish(tmp_path):
     from openagent.tools.fs import EditFileTool
     (tmp_path / "a").write_bytes(b"x")

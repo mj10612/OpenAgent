@@ -52,6 +52,7 @@ class ApplyPatchTool(BaseFSTool):
             cursor = 0
             index = 0
             hunks = 0
+            output_eof_marker: int | None = None
             while index < len(diff):
                 row = diff[index]
                 if not hunks and row.startswith(("--- ", "+++ ")):
@@ -81,16 +82,22 @@ class ApplyPatchTool(BaseFSTool):
                 index += 1
                 removed = added = 0
                 previous = ""
+                source_eof_marker_required = False
                 while index < len(diff) and not diff[index].startswith("@@ "):
                     row = diff[index]
                     index += 1
+                    if source_eof_marker_required and row != "\\ No newline at end of file":
+                        raise ValueError("Missing no-newline marker for source EOF")
                     if row == "\\ No newline at end of file":
                         if previous not in (" ", "+", "-"):
                             raise ValueError("Unexpected no-newline marker")
                         if previous in (" ", "+"):
                             output[-1] = output[-1].rstrip("\r\n")
-                        if previous in (" ", "-") and lines[cursor - 1].endswith("\n"):
-                            raise ValueError("No-newline marker conflicts with source")
+                            output_eof_marker = len(output) - 1
+                        if previous in (" ", "-"):
+                            if cursor != len(lines) or lines[cursor - 1].endswith("\n"):
+                                raise ValueError("No-newline marker conflicts with source EOF")
+                            source_eof_marker_required = False
                         previous = ""
                         continue
                     if not row or row[0] not in (" ", "+", "-"):
@@ -99,6 +106,7 @@ class ApplyPatchTool(BaseFSTool):
                     if kind in (" ", "-"):
                         if cursor >= len(lines) or lines[cursor].rstrip("\r\n") != text:
                             raise ValueError("Patch context does not match source")
+                        source_eof_marker_required = not lines[cursor].endswith("\n")
                         if kind == " ":
                             output.append(lines[cursor])
                         cursor += 1
@@ -108,12 +116,16 @@ class ApplyPatchTool(BaseFSTool):
                     if kind in (" ", "+"):
                         added += 1
                     previous = kind
+                if source_eof_marker_required:
+                    raise ValueError("Missing no-newline marker for source EOF")
                 if (removed, added) != (old_count, new_count):
                     raise ValueError("Hunk line counts do not match header")
                 hunks += 1
             if not hunks:
                 raise ValueError("Patch contains no hunks")
             output.extend(lines[cursor:])
+            if output_eof_marker is not None and output_eof_marker != len(output) - 1:
+                raise ValueError("No-newline marker must refer to output EOF")
             updated = "".join(output)
             if len(updated.encode("utf-8")) > MAX_FILE_BYTES:
                 raise ValueError("Patched file exceeds 2 MB size limit")
