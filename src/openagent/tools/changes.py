@@ -246,6 +246,21 @@ class ChangeTracker:
             for key in ("path", "source", "destination"):
                 if key in args:
                     args[key] = str(tool._resolve(args[key]).relative_to(tool.workspace_root))
+            if tool.name == "apply_patch":
+                # The preview runs in a temporary root. Translate only headers
+                # that name the original target; leave mismatches for the patch
+                # tool to reject with its usual path validation.
+                target = tool._resolve(arguments["path"])
+                rows = str(args["patch"]).splitlines(keepends=True)
+                for index, row in enumerate(rows):
+                    if row.startswith("@@ "):
+                        break
+                    if not row.startswith(("--- ", "+++ ")):
+                        continue
+                    name = row[4:].split("\t", 1)[0].rstrip("\r\n")
+                    if Path(name).is_absolute() and tool._resolve(name) == target:
+                        rows[index] = row[:4] + args["path"] + row[4 + len(name):]
+                args["patch"] = "".join(rows)
             result = await type(tool)(root).execute(**args)
             if result.is_error:
                 return result.output

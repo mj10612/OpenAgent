@@ -70,6 +70,37 @@ async def test_empty_file_creation_preview_shows_existence(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('absolute_argument', [False, True])
+async def test_patch_preview_translates_matching_absolute_headers(tmp_path, absolute_argument):
+    target = tmp_path / 'a.txt'
+    target.write_bytes(b'old\n')
+    path = str(target) if absolute_argument else 'a.txt'
+    patch = f'--- {target}\n+++ {target}\n@@ -1 +1 @@\n-old\n+new\n'
+    tool = ApplyPatchTool(tmp_path)
+
+    preview = await ChangeTracker().preview(tool, {'path': path, 'patch': patch})
+
+    assert '-old' in preview and '+new' in preview
+    assert target.read_bytes() == b'old\n'
+    result = await tool.execute(path=path, patch=patch)
+    assert not result.is_error, result.output
+    assert target.read_bytes() == b'new\n'
+
+
+@pytest.mark.asyncio
+async def test_patch_preview_rejects_mismatched_absolute_header(tmp_path):
+    target = tmp_path / 'a.txt'
+    target.write_bytes(b'old\n')
+    other = tmp_path / 'other.txt'
+    patch = f'--- {other}\n+++ {other}\n@@ -1 +1 @@\n-old\n+new\n'
+
+    preview = await ChangeTracker().preview(ApplyPatchTool(tmp_path), {'path': str(target), 'patch': patch})
+
+    assert 'Access denied' in preview or 'does not match' in preview
+    assert target.read_bytes() == b'old\n'
+
+
+@pytest.mark.asyncio
 async def test_partial_undo_failure_can_retry(tmp_path, monkeypatch):
     tracker = ChangeTracker()
     tool = WriteFileTool(tmp_path)
