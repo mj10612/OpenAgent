@@ -13,10 +13,12 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from collections.abc import Sequence
 from dataclasses import asdict, is_dataclass
+from pathlib import Path
 
 from rich.console import Console
 from rich.markup import escape
@@ -160,9 +162,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument(
         "prompt",
-        nargs="+",
+        nargs="*",
         help="Instruction or query to execute",
     )
+    run_parser.add_argument('--prompt-file', help='Read a UTF-8 prompt file (maximum 2 MiB); use - as the positional prompt for stdin')
     output = run_parser.add_mutually_exclusive_group()
     output.add_argument('--json', action='store_true', help='Print one versioned JSON result')
     output.add_argument('--jsonl', action='store_true', help='Print versioned JSON events and a terminal result')
@@ -197,6 +200,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sessions_parser.add_argument("session_target", nargs="?")
     sessions_parser.add_argument("--older-than", type=float, dest="older_than_days")
     sessions_parser.add_argument("--clear", action="store_true")
+    sessions_parser.add_argument('--dry-run', action='store_true', help='Preview prune/clear targets without deleting sessions')
     sessions_parser.add_argument('--output', '-o')
     sessions_parser.add_argument('--format', choices=['json', 'jsonl', 'markdown'], default='jsonl')
     sessions_parser.add_argument('--redact', action='store_true')
@@ -264,8 +268,11 @@ def _cmd_models(console: Console) -> int:
 
 def _cmd_sessions(console: Console, args: argparse.Namespace | None = None) -> int:
     session_dir = os.environ.get("OPENAGENT_SESSION_DIR")
-    store = SessionStore(storage_dir=session_dir)
     action = getattr(args, "session_action", "list")
+    dry_run = getattr(args, 'dry_run', False)
+    if dry_run and not (action == 'prune' or (action == 'list' and getattr(args, 'clear', False))):
+        raise ValueError('--dry-run requires sessions prune or sessions --clear')
+    store = SessionStore(storage_dir=session_dir, create_directory=not dry_run)
     if action in ('export', 'import', 'convert'):
         assert args is not None
         target = getattr(args, 'session_target', None)
@@ -298,6 +305,20 @@ def _cmd_sessions(console: Console, args: argparse.Namespace | None = None) -> i
         older_than = getattr(args, "older_than_days", None)
         if action == "prune" and older_than is None and not clear:
             raise ValueError("Use sessions prune --older-than <days> or sessions --clear")
+        if dry_run:
+            candidates, skipped = store.preview_cleanup_sessions(older_than_days=None if clear else older_than)
+            table = Table(title='Session deletion preview')
+            for column in ('ID', 'Title', 'Last updated (Unix seconds)'):
+                table.add_column(column)
+            for session_id, metadata in candidates.items():
+                table.add_row(escape(session_id), escape(metadata.title) if metadata else '(invalid metadata)',
+                              str(metadata.updated_at) if metadata else 'unknown')
+            console.print(table)
+            console.print(f'{len(candidates)} session(s) would be deleted. No sessions changed.', markup=False)
+            if skipped:
+                console.print('Skipped invalid age metadata: ' + ', '.join(skipped), markup=False)
+            console.print('Concurrent updates can change these targets; deletion rechecks each session.', markup=False)
+            return 0
         resolved = store.resolve_session_id(str(target)) if action in ("delete", "rm") else None
         if not getattr(args, "yes", False) and not Confirm.ask(
             "Delete selected sessions?", console=console, default=False
@@ -453,8 +474,38 @@ def _build_runner(
     return runner, mcp_manager
 
 
+MAX_PROMPT_BYTES = 2 * 1024 * 1024
+
+
+def _read_run_prompt(args: argparse.Namespace) -> str:
+    parts = args.prompt if isinstance(args.prompt, list) else [str(args.prompt)]
+    source = getattr(args, 'prompt_file', None)
+    if source and parts:
+        raise ValueError('Use either a positional prompt or --prompt-file, not both')
+    if '-' in parts and parts != ['-']:
+        raise ValueError('The stdin prompt - must be used alone')
+    if source:
+        with Path(source).expanduser().open('rb') as stream:
+            data = stream.read(MAX_PROMPT_BYTES + 1)
+        text = data.decode('utf-8') if len(data) <= MAX_PROMPT_BYTES else ''
+    elif parts == ['-']:
+        stdin_stream = getattr(sys.stdin, 'buffer', sys.stdin)
+        raw_data = stdin_stream.read(MAX_PROMPT_BYTES + 1)
+        data = raw_data.encode('utf-8') if isinstance(raw_data, str) else raw_data
+        text = data.decode('utf-8') if len(data) <= MAX_PROMPT_BYTES else ''
+    else:
+        text = ' '.join(parts)
+        data = text.encode('utf-8')
+    if len(data) > MAX_PROMPT_BYTES:
+        raise ValueError('Prompt exceeds 2 MiB limit')
+    if not text.strip():
+        raise ValueError('A non-empty prompt, stdin (-), or --prompt-file is required')
+    return text
+
+
 async def _async_run(args: argparse.Namespace, console: Console) -> int:
     """Execute run or chat subcommands asynchronously."""
+    prompt: str | Message = _read_run_prompt(args) if args.subcommand == 'run' else ''
     cfg = _load_args_config(args)
 
     runner, mcp_manager = _build_runner(cfg, console)
@@ -467,7 +518,6 @@ async def _async_run(args: argparse.Namespace, console: Console) -> int:
                 Console(stderr=True).print(f'Warning: configured tool is not registered: {name}', markup=False)
 
         if args.subcommand == "run":
-            prompt: str | Message = " ".join(args.prompt) if isinstance(args.prompt, list) else str(args.prompt)
             if getattr(args, 'image', []):
                 from openagent.attachments import load_images
                 prompt = Message.user(str(prompt), images=load_images(args.image, runner.provider))
@@ -484,7 +534,7 @@ async def _async_run(args: argparse.Namespace, console: Console) -> int:
                 import inspect
                 return bool(await decision) if inspect.isawaitable(decision) else bool(decision)
             ask_cb = preview_ask
-            if machine and not sys.stdin.isatty() and not cfg.auto_approve:
+            if not sys.stdin.isatty() and not cfg.auto_approve:
                 async def deny_ask(call):
                     return False
                 ask_cb = deny_ask
@@ -586,11 +636,10 @@ def _redact(value, cfg: OpenAgentConfig):
     for server in cfg.mcp_servers:
         secrets.extend((server.headers or {}).values())
         secrets.extend(v for k, v in (server.env or {}).items() if k.endswith(credential_suffixes) and v)
+    pattern = '|'.join(re.escape(secret) for secret in sorted(set(filter(None, secrets)), key=len, reverse=True))
     def clean(item):
         if isinstance(item, str):
-            for secret in secrets:
-                item = item.replace(secret, '[REDACTED]')
-            return item
+            return re.sub(pattern, lambda match: '[REDACTED]', item) if pattern else item
         if isinstance(item, dict):
             return {key: clean(data) for key, data in item.items()}
         if isinstance(item, list):
