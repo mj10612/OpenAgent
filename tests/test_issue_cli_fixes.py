@@ -8,6 +8,22 @@ from openagent.doctor import diagnose
 from openagent.tools.registry import PermissionAction
 
 
+@pytest.mark.parametrize('short_first', [True, False])
+def test_overlapping_credentials_redacted_from_original_text(monkeypatch, short_first):
+    from openagent.cli import _redact
+    from openagent.tools.mcp.client import MCPServerConfig
+
+    monkeypatch.setenv('AUDIT_API_KEY', 'audit-prefix-private-suffix')
+    cfg = OpenAgentConfig(
+        api_key='audit-prefix' if short_first else 'audit-prefix-private-suffix',
+        mcp_servers=[MCPServerConfig(name='fixture', command='fake',
+            env={'SERVICE_API_KEY': 'audit-prefix', 'EMPTY_API_KEY': ''})],
+    )
+    assert _redact({'nested': ['audit-prefix-private-suffix audit-prefix']}, cfg) == {
+        'nested': ['[REDACTED] [REDACTED]'],
+    }
+
+
 def test_mixed_policy_positions_preserve_deny_and_reset_between_parses():
     parser = _build_parser()
     args = parser.parse_args([

@@ -496,6 +496,8 @@ openagent sessions delete <id-or-prefix> --yes
 openagent sessions rm <id-or-prefix> --yes
 openagent sessions prune --older-than 30 --yes
 openagent sessions --clear --yes
+openagent sessions prune --older-than 30 --dry-run
+openagent sessions --clear --dry-run
 ```
 
 Destructive session commands ask for confirmation unless `--yes` is supplied.
@@ -555,6 +557,22 @@ openagent sessions convert legacy.jsonl --output converted.jsonl
 openagent run "update the file" --tool-policy write_file=allow --tool-policy delete_file=deny
 ```
 
+Read multiline UTF-8 prompts from a file or standard input:
+
+```bash
+openagent run --prompt-file review.txt --json
+git diff | openagent run - --json
+```
+
+Use one prompt source at a time. Prompts must be nonempty and at most 2 MiB;
+invalid input is rejected before connecting to the model. Reading piped input
+does not approve confirmation-required tools.
+
+Session cleanup supports `--dry-run` with `prune` or `--clear`. It lists IDs,
+titles, last-updated timestamps, counts, and skipped invalid age metadata without
+deleting sessions or asking for confirmation. Concurrent changes can alter the
+targets; actual deletion checks each session again under its lock.
+
 JSON/JSONL output has `schema_version: 1`. JSON contains a terminal result;
 JSONL contains ordered typed events followed by that result. Terminal outcomes
 are `success`, `error`, `partial_failure`, `iteration_limit`, or `cancelled`,
@@ -584,7 +602,10 @@ Image contents remain in saved sessions and count against context estimates;
 avoid keeping large attachments in long-running sessions.
 
 Builtin filesystem mutations are checkpointed per turn, including failed and
-cancelled turns. `/changes` shows their diffs and `/undo` restores the latest
+cancelled turns. `/checkpoints clear` asks for confirmation before permanently
+discarding undo history and freeing snapshot storage; current files and the
+conversation remain unchanged. New edits create checkpoints normally.
+`/changes` shows their diffs and `/undo` restores the latest
 turn only if files still match its recorded result. Content, mode and line endings
 are preserved; external shell/network/MCP side effects cannot be undone. Recovery
 does not run git reset. Checkpoints are memory-only, limited to twenty turns and

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from openagent.config import OpenAgentConfig
+from openagent.session.store import normalize_session_directory
 
 
 def diagnose(cfg: OpenAgentConfig) -> list[dict[str, Any]]:
@@ -46,7 +47,7 @@ def diagnose(cfg: OpenAgentConfig) -> list[dict[str, Any]]:
                 add(f'mcp:{server.name}:cwd', 'ok' if Path(server.cwd).is_dir() else 'error', 'Directory exists' if Path(server.cwd).is_dir() else 'Working directory missing')
         else:
             add(f'mcp:{server.name}:remote', 'warning', 'Remote health unchecked in offline mode', False)
-    directory = Path(os.environ.get('OPENAGENT_SESSION_DIR', str(Path.home() / '.openagent' / 'sessions')))
+    directory = normalize_session_directory(os.environ.get('OPENAGENT_SESSION_DIR'))
     ancestor = directory
     while not ancestor.exists() and ancestor != ancestor.parent:
         ancestor = ancestor.parent

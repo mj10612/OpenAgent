@@ -48,6 +48,12 @@ class ChangeTracker:
             self._close_turn(turn)
         self.turns = self.turns[-20:]
 
+    def clear(self) -> None:
+        """Discard undo snapshots without restoring or changing workspace files."""
+        for turn in self.turns:
+            self._close_turn(turn)
+        self.turns = [[]]
+
     def _paths(self, tool: Any, arguments: dict[str, Any]) -> list[Path]:
         if not isinstance(tool, BaseFSTool) or tool.danger != "write":
             return []

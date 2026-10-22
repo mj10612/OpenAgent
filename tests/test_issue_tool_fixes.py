@@ -18,6 +18,30 @@ from openagent.tools.registry import ToolRegistry
 
 
 @pytest.mark.asyncio
+async def test_clear_checkpoints_preserves_files_releases_storage_and_allows_undo(tmp_path):
+    registry = ToolRegistry(create_fs_tools(tmp_path), danger_policies={'write': 'allow'})
+    large = tmp_path / 'large'
+    large.write_bytes(b'x' * (MAX_FILE_BYTES + 1))
+    result = await registry.execute_call(ToolCall(name='delete_file', arguments={'path': 'large'}))
+    assert not result.is_error
+    backup = registry.changes.turns[-1][0]['before'][large].backup
+    result = await registry.execute_call(ToolCall(name='write_file', arguments={'path': 'a', 'content': 'kept'}))
+    assert not result.is_error
+    registry.changes.clear()
+    assert backup.closed
+    assert not large.exists()
+    assert (tmp_path / 'a').read_text() == 'kept'
+    assert registry.changes._retained_bytes() == 0
+    assert registry.changes._retained_disk_bytes() == 0
+    assert registry.changes.describe() == 'No tracked changes.'
+    assert registry.changes.undo() == 'No tracked changes to undo.'
+    result = await registry.execute_call(ToolCall(name='write_file', arguments={'path': 'a', 'content': 'next'}))
+    assert not result.is_error
+    registry.changes.undo()
+    assert (tmp_path / 'a').read_text() == 'kept'
+
+
+@pytest.mark.asyncio
 async def test_checkpoint_counts_both_snapshots_before_publish(tmp_path):
     registry = ToolRegistry(create_fs_tools(tmp_path), danger_policies={'write': 'allow'})
     registry.changes.max_bytes = 8

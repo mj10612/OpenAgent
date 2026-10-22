@@ -30,6 +30,13 @@ from openagent.core.types import Message
 logger = logging.getLogger(__name__)
 
 
+def normalize_session_directory(storage_dir: str | Path | None = None) -> Path:
+    """Resolve a session destination without creating directories."""
+    if storage_dir is None or (isinstance(storage_dir, str) and not storage_dir.strip()):
+        return Path.home() / ".openagent" / "sessions"
+    return Path(storage_dir).expanduser().resolve()
+
+
 class SessionConflictError(RuntimeError):
     """The saved session changed after this writer loaded it."""
 
@@ -76,13 +83,11 @@ class SessionMetadata:
 class SessionStore:
     """Manages persistence of conversation histories in JSONL format with atomic writes."""
 
-    def __init__(self, storage_dir: str | Path | None = None, *, incremental: bool = True) -> None:
+    def __init__(self, storage_dir: str | Path | None = None, *, incremental: bool = True, create_directory: bool = True) -> None:
         self.incremental = incremental
-        if storage_dir is None or (isinstance(storage_dir, str) and not storage_dir.strip()):
-            self._storage_dir = Path.home() / ".openagent" / "sessions"
-        else:
-            self._storage_dir = Path(storage_dir).expanduser().resolve()
-        self._storage_dir.mkdir(parents=True, exist_ok=True)
+        self._storage_dir = normalize_session_directory(storage_dir)
+        if create_directory:
+            self._storage_dir.mkdir(parents=True, exist_ok=True)
         self._cache: dict[str, tuple[SessionMetadata, list[str], tuple[int, int]]] = {}
         self._revisions: dict[str, tuple[int, int] | None] = {}
 
@@ -602,27 +607,63 @@ class SessionStore:
             raise ValueError(f"Session prefix '{session_id}' is ambiguous")
         return matches[0]
 
-    def cleanup_sessions(self, *, older_than_days: float | None = None) -> int:
-        """Delete all sessions, or those last updated more than N days ago."""
+    @staticmethod
+    def _cleanup_cutoff(older_than_days: float | None) -> float | None:
         if older_than_days is not None and (
             not math.isfinite(older_than_days) or older_than_days < 0
         ):
             raise ValueError("Session age must be finite and nonnegative")
-        cutoff = time.time() - older_than_days * 86400 if older_than_days is not None else None
+        return time.time() - older_than_days * 86400 if older_than_days is not None else None
+
+    def _cleanup_candidate(
+        self, path: Path, cutoff: float | None, *, include_metadata: bool = False,
+    ) -> tuple[bool, SessionMetadata | None, bool]:
+        """Return eligibility, optional metadata, and whether age metadata was invalid."""
+        if not path.is_file():
+            return False, None, False
+        if cutoff is None and not include_metadata:
+            return True, None, False
+        try:
+            metadata = self._load_metadata(path.stem)
+        except FileNotFoundError:
+            return False, None, False
+        except (TypeError, ValueError, AttributeError, KeyError):
+            return cutoff is None, None, cutoff is not None
+        return cutoff is None or metadata.updated_at < cutoff, metadata, False
+
+    def preview_cleanup_sessions(
+        self, *, older_than_days: float | None = None,
+    ) -> tuple[dict[str, SessionMetadata | None], list[str]]:
+        """Read cleanup candidates without locking, writing, or recovering sessions.
+
+        Return a mapping from candidate IDs to metadata and IDs skipped because
+        their age metadata is invalid. Clear-all includes corrupt sessions with
+        metadata set to None. This is a snapshot; cleanup rechecks under its lock.
+        """
+        cutoff = self._cleanup_cutoff(older_than_days)
+        candidates: dict[str, SessionMetadata | None] = {}
+        skipped: list[str] = []
+        for path in sorted(self._storage_dir.glob("*.jsonl")):
+            eligible, metadata, invalid_age = self._cleanup_candidate(
+                path, cutoff, include_metadata=True,
+            )
+            if eligible:
+                candidates[path.stem] = metadata
+            elif invalid_age:
+                skipped.append(path.stem)
+        return candidates, skipped
+
+    def cleanup_sessions(self, *, older_than_days: float | None = None) -> int:
+        """Delete all sessions, or those last updated more than N days ago."""
+        cutoff = self._cleanup_cutoff(older_than_days)
         removed = 0
         for path in self._storage_dir.glob("*.jsonl"):
             with self._locked(path.stem):
-                if not path.exists():
-                    continue
-                if cutoff is not None:
-                    try:
-                        metadata = self._load_metadata(path.stem)
-                    except (TypeError, ValueError, AttributeError, KeyError):
-                        logger.warning("Session %s: skipped cleanup with invalid age metadata", path.stem)
-                        continue
-                    if metadata.updated_at >= cutoff:
-                        continue
-                removed += self._delete_session(path.stem)
+                eligible, _, invalid_age = self._cleanup_candidate(path, cutoff)
+                if invalid_age:
+                    logger.warning("Session %s: skipped cleanup with invalid age metadata", path.stem)
+                if eligible:
+                    removed += self._delete_session(path.stem)
         return removed
 
     def _atomic_write_session(
