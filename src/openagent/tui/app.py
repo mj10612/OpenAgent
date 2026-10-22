@@ -315,6 +315,7 @@ async def run_repl(
                 "  /prompt - Show the active system prompt and workspace instructions\n"
                 "  /attach <path> - Attach an image to the next prompt; /attachments clear to discard\n"
                 "  /changes - Preview tracked file changes; /undo - Restore the latest file checkpoint\n"
+                "  /checkpoints clear - Discard undo history while keeping current file edits\n"
                 "  Multiline: enter triple quotes on their own line, then close with the same delimiter.\n"
             )
             continue
@@ -332,6 +333,25 @@ async def run_repl(
         if not multiline and stripped.lower() == '/attachments clear':
             pending_images.clear()
             active_console.print('Attachments cleared.', markup=False)
+            continue
+        if not multiline and stripped.lower() == '/checkpoints clear':
+            active_console.print(
+                'Permanently discard all undo checkpoints? Current files and conversation will be kept.',
+                markup=False,
+            )
+            try:
+                answer = (
+                    await session.prompt_async('Confirm [yes/no]: ')
+                    if session is not None
+                    else await asyncio.to_thread(input, 'Confirm [yes/no]: ')
+                )
+            except (KeyboardInterrupt, EOFError):
+                answer = ''
+            if answer.strip().lower() == 'yes':
+                runner.tools.changes.clear()
+                active_console.print('Undo checkpoints cleared.', markup=False)
+            else:
+                active_console.print('Checkpoint clearing cancelled.', markup=False)
             continue
         if not multiline and stripped.lower() in ('/changes', '/undo'):
             try:

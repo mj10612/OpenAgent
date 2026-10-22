@@ -584,7 +584,10 @@ Image contents remain in saved sessions and count against context estimates;
 avoid keeping large attachments in long-running sessions.
 
 Builtin filesystem mutations are checkpointed per turn, including failed and
-cancelled turns. `/changes` shows their diffs and `/undo` restores the latest
+cancelled turns. `/checkpoints clear` asks for confirmation before permanently
+discarding undo history and freeing snapshot storage; current files and the
+conversation remain unchanged. New edits create checkpoints normally.
+`/changes` shows their diffs and `/undo` restores the latest
 turn only if files still match its recorded result. Content, mode and line endings
 are preserved; external shell/network/MCP side effects cannot be undone. Recovery
 does not run git reset. Checkpoints are memory-only, limited to twenty turns and

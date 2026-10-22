@@ -30,6 +30,19 @@ class FakeProvider(ChatProvider):
         )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('answer,cleared', [('yes', True), ('no', False)])
+async def test_clear_checkpoints_requires_confirmation_preserves_conversation(monkeypatch, answer, cleared):
+    console, output = setup_input(monkeypatch, ['/checkpoints clear', answer, '/exit'])
+    runner = AgentRunner(FakeProvider())
+    runner.tools.changes.turns[-1].append({'tool': 'shell', 'irreversible': True})
+    history = list(runner.messages.messages)
+    await tui.run_repl(runner, console=console)
+    assert bool(runner.tools.changes.turns[-1]) is not cleared
+    assert runner.messages.messages == history
+    assert 'permanently' in output.getvalue().lower()
+
+
 def setup_input(monkeypatch, lines):
     iterator = iter(lines)
 
