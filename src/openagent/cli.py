@@ -233,10 +233,13 @@ def _tool_policy_args(args: argparse.Namespace) -> dict[str, PermissionAction] |
 
 
 def _load_args_config(args: argparse.Namespace) -> OpenAgentConfig:
-    return load_config(config_path=args.config, model=args.model, base_url=args.base_url,
+    cfg = load_config(config_path=args.config, model=args.model, base_url=args.base_url,
                        api_key=args.api_key, workspace=args.workspace,
                        auto_approve=args.yes if args.yes else None, session_id=args.resume,
                        tool_policy=_tool_policy_args(args))
+    # Retain successfully loaded credentials for the outer startup-error handler.
+    args._redaction_config = cfg
+    return cfg
 
 
 def _cmd_models(console: Console) -> int:
@@ -629,11 +632,13 @@ def _emit_json(value) -> None:
     print(json.dumps(value, ensure_ascii=False, allow_nan=False))
 
 
-def _redact(value, cfg: OpenAgentConfig):
+def _redact(value, cfg: OpenAgentConfig | None = None, *, api_key: str | None = None):
     credential_suffixes = ('API_KEY', 'ACCESS_TOKEN', 'AUTH_TOKEN')
-    secrets = [cfg.api_key] if cfg.api_key else []
+    secrets = [api_key] if api_key else []
+    if cfg is not None and cfg.api_key:
+        secrets.append(cfg.api_key)
     secrets.extend(v for k, v in os.environ.items() if k.endswith(credential_suffixes) and v)
-    for server in cfg.mcp_servers:
+    for server in cfg.mcp_servers if cfg is not None else []:
         secrets.extend((server.headers or {}).values())
         secrets.extend(v for k, v in (server.env or {}).items() if k.endswith(credential_suffixes) and v)
     pattern = '|'.join(re.escape(secret) for secret in sorted(set(filter(None, secrets)), key=len, reverse=True))
@@ -780,7 +785,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 130
     except Exception as exc:
         if getattr(args, 'json', False) or getattr(args, 'jsonl', False):
-            _emit_json({'schema_version': 1, 'type': 'result', 'outcome': 'error', 'exit_code': 1, 'errors': [str(exc)]})
+            _emit_json(_redact(
+                {'schema_version': 1, 'type': 'result', 'outcome': 'error', 'exit_code': 1, 'errors': [str(exc)]},
+                getattr(args, '_redaction_config', None), api_key=args.api_key,
+            ))
             return 1
         console.print(f"\n[bold red]Error:[/bold red] {escape(str(exc))}")
         return 1
