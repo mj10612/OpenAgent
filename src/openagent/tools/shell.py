@@ -76,6 +76,13 @@ async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
             os.killpg(proc.pid, signal.SIGKILL)
 
 
+async def _spawn_shell_exec(*arguments: str, **options: Any) -> asyncio.subprocess.Process:
+    if sys.platform == 'win32':
+        supervisor = str(Path(__file__).with_name('_windows_job.py'))
+        arguments = (sys.executable, supervisor, *arguments)
+    return await asyncio.create_subprocess_exec(*arguments, **options)
+
+
 def _truncate_output(text: str, cap: int = MAX_OUTPUT_BYTES) -> str:
     """Cap output string to limit and append truncation indicator if exceeded."""
     raw_bytes = text.encode("utf-8", errors="replace")
@@ -161,7 +168,7 @@ class ShellTool(Tool):
         process_options["env"] = {key: value for key, value in os.environ.items() if key.upper() in SAFE_ENV_KEYS}
         try:
             if self.shell_type == "powershell":
-                proc = await asyncio.create_subprocess_exec(
+                proc = await _spawn_shell_exec(
                     "powershell.exe",
                     "-NoProfile",
                     "-NonInteractive",
@@ -175,7 +182,7 @@ class ShellTool(Tool):
                     **process_options,
                 )
             elif self.shell_type == "cmd":
-                proc = await asyncio.create_subprocess_exec(
+                proc = await _spawn_shell_exec(
                     os.environ.get("COMSPEC", "cmd.exe"),
                     "/c",
                     command,
@@ -186,10 +193,18 @@ class ShellTool(Tool):
                 )
             elif self.shell_type in ("bash", "sh"):
                 sh_binary = shutil.which(self.shell_type) or "/bin/sh"
-                proc = await asyncio.create_subprocess_exec(
+                proc = await _spawn_shell_exec(
                     sh_binary,
                     "-c",
                     command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=str(work_dir) if work_dir else None,
+                    **process_options,
+                )
+            elif sys.platform == 'win32':
+                proc = await _spawn_shell_exec(
+                    '--shell-command', command,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     cwd=str(work_dir) if work_dir else None,
