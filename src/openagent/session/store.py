@@ -487,6 +487,9 @@ class SessionStore:
                     call["raw_arguments"] = json.dumps(call["arguments"], ensure_ascii=False)
                 if row["role"] == "tool":
                     row["content"] = [{"type": "text", "text": "[REDACTED tool output]"}]
+                    # Tool metadata can duplicate the entire result, including
+                    # structured content and arbitrary raw provider payloads.
+                    row["metadata"] = {"is_error": bool(row.get("metadata", {}).get("is_error", False))}
         meta = metadata.to_dict()
         meta["type"] = "metadata"
         if format == "json":
