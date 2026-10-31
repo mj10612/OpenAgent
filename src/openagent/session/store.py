@@ -506,8 +506,8 @@ class SessionStore:
         else:
             raise ValueError("Export format must be json, jsonl or markdown")
         target = Path(destination).expanduser().resolve()
-        if target == self._get_session_path(session_id):
-            raise ValueError("Export destination must differ from source session")
+        if target.parent == self._storage_dir.resolve() and target.suffix == ".jsonl":
+            raise ValueError("Export destination must not be a live session archive")
         temporary = target.with_name(f"{target.name}.{uuid.uuid4().hex}.tmp")
         try:
             temporary.write_text(text, encoding="utf-8")
