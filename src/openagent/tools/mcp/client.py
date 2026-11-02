@@ -178,10 +178,10 @@ class MCPClient:
         self._transport_task = asyncio.create_task(self._run_transport(ready, self._close_event))
         try:
             await asyncio.shield(ready)
-        except BaseException:
+        except BaseException as exc:
             if not ready.done():
                 ready.cancel()
-            await self._close_transport(cancel=True)
+            await self._close_transport(cancel=isinstance(exc, asyncio.CancelledError))
             raise
 
     async def _run_transport(self, ready: asyncio.Future[None], stop: asyncio.Event) -> None:
