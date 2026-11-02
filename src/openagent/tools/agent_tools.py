@@ -87,6 +87,23 @@ class TodoTool(Tool):
             lines.append(f"{i}. {box} {t['text']}")
         return "\n".join(lines)
 
+    def snapshot_state(self) -> dict[str, Any]:
+        """Preserve the ordered, one-based task IDs and completion flags."""
+        return {'version': 1, 'tasks': [dict(task) for task in self._tasks]}
+
+    def restore_state(self, state: Any) -> None:
+        if state is None:
+            self._tasks = []
+            return
+        if (not isinstance(state, dict) or type(state.get('version')) is not int
+                or state['version'] != 1 or not isinstance(state.get('tasks'), list)):
+            raise ValueError('Invalid or unsupported checklist state')
+        tasks = state['tasks']
+        if any(not isinstance(task, dict) or not isinstance(task.get('text'), str)
+               or type(task.get('done')) is not bool for task in tasks):
+            raise ValueError('Invalid checklist task')
+        self._tasks = [{'text': task['text'], 'done': task['done']} for task in tasks]
+
     async def execute(self, **kwargs: Any) -> ToolResult:
         call_id = str(kwargs.get("call_id", ""))
         action = str(kwargs.get("action", ""))

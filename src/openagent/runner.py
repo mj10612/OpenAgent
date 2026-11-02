@@ -9,6 +9,7 @@ Licensed under the Apache License, Version 2.0.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from pathlib import Path
 
@@ -38,9 +39,12 @@ from openagent.core.types import (
 )
 from openagent.prompts.base import PromptBuilder
 from openagent.session.store import SessionStore
+from openagent.tools.agent_tools import TodoTool
 from openagent.tools.registry import AskCallback, ToolRegistry
 
 __all__ = ["AgentRunner"]
+
+logger = logging.getLogger(__name__)
 
 
 class AgentRunner:
@@ -108,10 +112,22 @@ class AgentRunner:
             self.messages = messages
         elif self.session_store is not None and self.session_id is not None:
             self.session_id = self.session_store.resolve_session_id(self.session_id)
-            _, loaded_msgs = self.session_store.load_session(self.session_id)
+            metadata, loaded_msgs = self.session_store.load_session(self.session_id)
             self.messages = MessageManager(loaded_msgs)
+            todo = self.tools.get('todo')
+            if isinstance(todo, TodoTool):
+                try:
+                    todo.restore_state(metadata.todo_state)
+                except ValueError as exc:
+                    logger.warning('Skipped invalid checklist state: %s', exc)
+                    todo.restore_state(None)
         else:
             self.messages = MessageManager()
+
+        if not self._resuming_session:
+            todo = self.tools.get('todo')
+            if isinstance(todo, TodoTool):
+                todo.restore_state(None)
 
         self._ensure_system_prompt(refresh=True)
 
@@ -140,6 +156,9 @@ class AgentRunner:
                 self.session_id = self.session_store.create_session(model=self.model)
             metadata = self.session_store.load_metadata(self.session_id)
             metadata.model = self.model
+            todo = self.tools.get('todo')
+            if isinstance(todo, TodoTool):
+                metadata.todo_state = todo.snapshot_state()
             self.session_store.save_messages(self.session_id, self.messages.messages, metadata=metadata)
 
     async def run_turn(
@@ -416,4 +435,7 @@ class AgentRunner:
         """Clear active turn state while preserving or re-initializing configuration."""
         self.messages.clear()
         self.session_id = None
+        todo = self.tools.get('todo')
+        if isinstance(todo, TodoTool):
+            todo.restore_state(None)
         self._ensure_system_prompt()
