@@ -179,7 +179,9 @@ class MCPClient:
         try:
             await asyncio.shield(ready)
         except BaseException:
-            await self._close_transport()
+            if not ready.done():
+                ready.cancel()
+            await self._close_transport(cancel=True)
             raise
 
     async def _run_transport(self, ready: asyncio.Future[None], stop: asyncio.Event) -> None:
@@ -243,11 +245,13 @@ class MCPClient:
                 self._session = None
                 self._is_connected = False
 
-    async def _close_transport(self) -> None:
+    async def _close_transport(self, *, cancel: bool = False) -> None:
         task = self._transport_task
         if task is not None:
             if self._close_event is not None:
                 self._close_event.set()
+            if cancel and not task.done():
+                task.cancel()
             try:
                 await asyncio.shield(task)
             finally:
