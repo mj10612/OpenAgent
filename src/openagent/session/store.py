@@ -9,6 +9,8 @@ Licensed under the Apache License, Version 2.0.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import contextlib
 import importlib
 import json
@@ -28,6 +30,10 @@ from openagent.context.messages import MessageManager
 from openagent.core.types import Message
 
 logger = logging.getLogger(__name__)
+
+_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+_MAX_IMAGE_BYTES = 5 * 1024 * 1024
+_MAX_IMAGE_BASE64_LENGTH = ((_MAX_IMAGE_BYTES + 2) // 3) * 4
 
 
 def normalize_session_directory(storage_dir: str | Path | None = None) -> Path:
@@ -735,6 +741,28 @@ class SessionStore:
                     raise ValueError("invalid content part")
                 if part.get("type") in {"text", "thinking"} and not isinstance(part.get("text"), str):
                     raise ValueError("invalid text part")
+                if part.get("type") == "image":
+                    image_data = part.get("data")
+                    url = part.get("url")
+                    mime_type = part.get("mime_type", "image/png")
+                    detail = part.get("detail", "auto")
+                    if image_data is None and url is None:
+                        raise ValueError("image part requires a source")
+                    if image_data is not None:
+                        if not isinstance(image_data, str) or not image_data or len(image_data) > _MAX_IMAGE_BASE64_LENGTH:
+                            raise ValueError("invalid image data")
+                        try:
+                            decoded = base64.b64decode(image_data, validate=True)
+                        except (binascii.Error, ValueError) as exc:
+                            raise ValueError("invalid image data") from exc
+                        if not decoded or len(decoded) > _MAX_IMAGE_BYTES:
+                            raise ValueError("invalid image data")
+                    if url is not None and (not isinstance(url, str) or not url):
+                        raise ValueError("invalid image URL")
+                    if not isinstance(mime_type, str) or mime_type not in _IMAGE_MIME_TYPES:
+                        raise ValueError("invalid image MIME type")
+                    if detail not in {"auto", "low", "high"}:
+                        raise ValueError("invalid image detail")
         if "metadata" in payload and not isinstance(payload["metadata"], Mapping):
             raise ValueError("invalid message metadata")
         if "created_at" in payload and (type(payload["created_at"]) not in (int, float) or not math.isfinite(payload["created_at"])):
