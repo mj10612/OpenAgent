@@ -6,6 +6,8 @@ Licensed under the Apache License, Version 2.0.
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -245,6 +247,65 @@ async def test_mcp_client_sse_connect() -> None:
         mock_session_cls.assert_called_once_with(
             "read_stream", "write_stream", read_timeout_seconds=30.0
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_phase", ["transport", "initialize"])
+async def test_mcp_client_cancel_incomplete_handshake_and_reconnect(
+    blocked_phase: str,
+) -> None:
+    entered = asyncio.Event()
+    transport_attempt = 0
+    session_attempt = 0
+
+    @asynccontextmanager
+    async def fake_transport(*args: Any, **kwargs: Any) -> Any:
+        nonlocal transport_attempt
+        transport_attempt += 1
+        if blocked_phase == "transport" and transport_attempt == 1:
+            entered.set()
+            await asyncio.Event().wait()
+        yield ("read_stream", "write_stream")
+
+    class FakeSession:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            nonlocal session_attempt
+            session_attempt += 1
+            self.attempt = session_attempt
+
+        async def __aenter__(self) -> FakeSession:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def initialize(self) -> MagicMock:
+            if blocked_phase == "initialize" and self.attempt == 1:
+                entered.set()
+                await asyncio.Event().wait()
+            return MagicMock()
+
+    cfg = MCPServerConfig(name="stdio-srv", command="test-cmd")
+    with (
+        patch("openagent.tools.mcp.client.stdio_client", fake_transport),
+        patch("openagent.tools.mcp.client.ClientSession", FakeSession),
+    ):
+        client = MCPClient(cfg)
+        connect_task = asyncio.create_task(client.connect())
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        connect_task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(connect_task, timeout=1)
+
+        assert client._transport_task is None
+        assert not client.is_connected
+        await asyncio.wait_for(client.close(), timeout=1)
+
+        await asyncio.wait_for(client.connect(), timeout=1)
+        assert client.is_connected
+        await asyncio.wait_for(client.close(), timeout=1)
+        assert not client.is_connected
 
 
 # --------------------------------------------------------------------------- #
