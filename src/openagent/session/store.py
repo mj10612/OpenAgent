@@ -9,6 +9,8 @@ Licensed under the Apache License, Version 2.0.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import contextlib
 import importlib
 import json
@@ -20,6 +22,7 @@ import sys
 import time
 import uuid
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -28,6 +31,10 @@ from openagent.context.messages import MessageManager
 from openagent.core.types import Message
 
 logger = logging.getLogger(__name__)
+
+_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+_MAX_IMAGE_BYTES = 5 * 1024 * 1024
+_MAX_IMAGE_BASE64_LENGTH = ((_MAX_IMAGE_BYTES + 2) // 3) * 4
 
 
 def normalize_session_directory(storage_dir: str | Path | None = None) -> Path:
@@ -51,6 +58,7 @@ class SessionMetadata:
     model: str = ""
     title: str = ""
     message_count: int = 0
+    todo_state: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert metadata to a serializable dictionary."""
@@ -61,6 +69,7 @@ class SessionMetadata:
             "model": self.model,
             "title": self.title,
             "message_count": self.message_count,
+            **({'todo_state': deepcopy(self.todo_state)} if self.todo_state is not None else {}),
         }
 
     @classmethod
@@ -70,6 +79,10 @@ class SessionMetadata:
         updated_at = float(data.get("updated_at", time.time()))
         if not math.isfinite(created_at) or not math.isfinite(updated_at):
             raise ValueError("Session timestamps must be finite")
+        todo_state = data.get('todo_state')
+        if todo_state is not None and not isinstance(todo_state, Mapping):
+            logger.warning('Skipped invalid checklist state in session metadata')
+            todo_state = None
         return cls(
             session_id=str(data.get("session_id", "")),
             created_at=created_at,
@@ -77,6 +90,7 @@ class SessionMetadata:
             model=str(data.get("model", "")),
             title=str(data.get("title", "")),
             message_count=int(data.get("message_count", 0)),
+            todo_state=deepcopy(dict(todo_state)) if todo_state is not None else None,
         )
 
 
@@ -223,6 +237,7 @@ class SessionStore:
                         model=existing_meta.model,
                         title=existing_meta.title,
                         message_count=len(messages),
+                        todo_state=deepcopy(existing_meta.todo_state),
                     )
                 except Exception:
                     metadata = SessionMetadata(
@@ -491,6 +506,8 @@ class SessionStore:
                     # structured content and arbitrary raw provider payloads.
                     row["metadata"] = {"is_error": bool(row.get("metadata", {}).get("is_error", False))}
         meta = metadata.to_dict()
+        if redact:
+            meta.pop('todo_state', None)
         meta["type"] = "metadata"
         if format == "json":
             text = json.dumps({"schema_version": 1, "metadata": meta, "messages": rows}, ensure_ascii=False, indent=2) + "\n"
@@ -506,8 +523,8 @@ class SessionStore:
         else:
             raise ValueError("Export format must be json, jsonl or markdown")
         target = Path(destination).expanduser().resolve()
-        if target == self._get_session_path(session_id):
-            raise ValueError("Export destination must differ from source session")
+        if target.parent == self._storage_dir.resolve() and target.suffix == ".jsonl":
+            raise ValueError("Export destination must not be a live session archive")
         temporary = target.with_name(f"{target.name}.{uuid.uuid4().hex}.tmp")
         try:
             temporary.write_text(text, encoding="utf-8")
@@ -735,6 +752,28 @@ class SessionStore:
                     raise ValueError("invalid content part")
                 if part.get("type") in {"text", "thinking"} and not isinstance(part.get("text"), str):
                     raise ValueError("invalid text part")
+                if part.get("type") == "image":
+                    image_data = part.get("data")
+                    url = part.get("url")
+                    mime_type = part.get("mime_type", "image/png")
+                    detail = part.get("detail", "auto")
+                    if image_data is None and url is None:
+                        raise ValueError("image part requires a source")
+                    if image_data is not None:
+                        if not isinstance(image_data, str) or not image_data or len(image_data) > _MAX_IMAGE_BASE64_LENGTH:
+                            raise ValueError("invalid image data")
+                        try:
+                            decoded = base64.b64decode(image_data, validate=True)
+                        except (binascii.Error, ValueError) as exc:
+                            raise ValueError("invalid image data") from exc
+                        if not decoded or len(decoded) > _MAX_IMAGE_BYTES:
+                            raise ValueError("invalid image data")
+                    if url is not None and (not isinstance(url, str) or not url):
+                        raise ValueError("invalid image URL")
+                    if not isinstance(mime_type, str) or mime_type not in _IMAGE_MIME_TYPES:
+                        raise ValueError("invalid image MIME type")
+                    if detail not in {"auto", "low", "high"}:
+                        raise ValueError("invalid image detail")
         if "metadata" in payload and not isinstance(payload["metadata"], Mapping):
             raise ValueError("invalid message metadata")
         if "created_at" in payload and (type(payload["created_at"]) not in (int, float) or not math.isfinite(payload["created_at"])):

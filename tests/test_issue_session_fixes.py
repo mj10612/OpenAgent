@@ -140,3 +140,39 @@ def test_valid_string_arguments_and_forgiving_core_parser_are_preserved(tmp_path
     assert call.arguments == {'nested': {'value': 3}}
     assert call.raw_arguments == raw
     assert ToolCall.from_dict({'name': 'echo', 'arguments': 'broken'}).arguments == {}
+
+
+@pytest.mark.parametrize(
+    'image',
+    [
+        {'type': 'image', 'data': {'invalid': 'object'}, 'mime_type': 'image/png'},
+        {'type': 'image', 'mime_type': 'image/png'},
+        {'type': 'image', 'data': 'not base64!', 'mime_type': 'image/png'},
+        {'type': 'image', 'data': 'AA==', 'mime_type': 42},
+        {'type': 'image', 'data': 'AA==', 'mime_type': 'image/svg+xml'},
+        {'type': 'image', 'data': 'AA==', 'mime_type': 'image/png', 'detail': 'full'},
+        {'type': 'image', 'url': 42, 'mime_type': 'image/png'},
+    ],
+)
+def test_import_rejects_malformed_image_parts(tmp_path, image):
+    row = {'role': 'user', 'content': [image]}
+    with pytest.raises(ValueError):
+        SessionStore(tmp_path / 'sessions').import_session(snapshot(tmp_path, [row]))
+
+
+@pytest.mark.parametrize(
+    'image',
+    [
+        {'type': 'image', 'data': 'AA==', 'mime_type': 'image/png', 'detail': 'high'},
+        {'type': 'image', 'url': 'https://example.test/image.webp', 'mime_type': 'image/webp'},
+    ],
+)
+def test_valid_image_session_round_trip_is_preserved(tmp_path, image):
+    store = SessionStore(tmp_path / 'sessions')
+    sid = store.import_session(snapshot(tmp_path, [{'role': 'user', 'content': [image]}]))
+    assert store.load_session(sid)[1][0].to_dict()['content'][0] == {
+        **image,
+        'data': image.get('data'),
+        'url': image.get('url'),
+        'detail': image.get('detail', 'auto'),
+    }

@@ -601,6 +601,14 @@ queues an image for the next prompt and `/attachments clear` discards attachment
 Image contents remain in saved sessions and count against context estimates;
 avoid keeping large attachments in long-running sessions.
 
+Todo checklists are saved with each persisted turn and restored
+by `--resume`, including task order, one-based task numbers, and completion flags.
+New sessions and `/clear` start with an empty checklist. JSON/JSONL export/import
+preserves checklist state; redacted exports omit that structured state. Legacy
+sessions default to an empty checklist, and invalid or unsupported checklist
+state is skipped with a warning while conversation history remains available.
+Checklist state is independent of filesystem undo checkpoints.
+
 Builtin filesystem mutations are checkpointed per turn, including failed and
 cancelled turns. `/checkpoints clear` asks for confirmation before permanently
 discarding undo history and freeing snapshot storage; current files and the
