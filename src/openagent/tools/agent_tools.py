@@ -7,7 +7,6 @@ Licensed under the Apache License, Version 2.0.
 from __future__ import annotations
 
 import asyncio
-import html
 import ipaddress
 import re
 import socket
@@ -219,8 +218,8 @@ class _HTMLTextExtractor(HTMLParser):
 
     def get_text(self) -> str:
         raw = "".join(self._pieces)
-        decoded = html.unescape(raw)
-        lines = [line.strip() for line in decoded.splitlines()]
+        # HTMLParser has already decoded character references once.
+        lines = [line.strip() for line in raw.splitlines()]
         cleaned = "\n".join(line for line in lines if line)
         return re.sub(r"\n{3,}", "\n\n", cleaned)
 
