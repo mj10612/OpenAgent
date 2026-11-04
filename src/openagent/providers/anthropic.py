@@ -261,7 +261,11 @@ class AnthropicProvider(ChatProvider):
                         case "message_start":
                             msg_usage = (data.get("message") or {}).get("usage") or {}
                             usage = Usage(
-                                prompt_tokens=int(msg_usage.get("input_tokens", 0)),
+                                # Anthropic reports uncached input, cache reads,
+                                # and cache creation as disjoint input counts.
+                                prompt_tokens=sum(int(msg_usage.get(key, 0)) for key in (
+                                    "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
+                                )),
                                 completion_tokens=int(msg_usage.get("output_tokens", 0)),
                                 cached_tokens=int(msg_usage.get("cache_read_input_tokens", 0)),
                             )
