@@ -167,7 +167,11 @@ class OpenAgentConfig:
         self.danger_policy = _normalize_danger_policy(self.danger_policy)
         if set(self.danger_policy) - set(DEFAULT_DANGER_POLICIES):
             raise ValueError('Unknown danger_policy level')
+        server_names: set[str] = set()
         for server in self.mcp_servers:
+            if server.name in server_names:
+                raise ValueError(f'Duplicate MCP server name: {server.name!r}')
+            server_names.add(server.name)
             for key in ('timeout', 'read_timeout'):
                 value = getattr(server, key)
                 if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or value <= 0):

@@ -47,7 +47,11 @@ class MCPManager:
         self._client_factory: Callable[[MCPServerConfig], MCPClient] = (
             client_factory if client_factory is not None else MCPClient
         )
-        self.configs: dict[str, MCPServerConfig] = {cfg.name: cfg for cfg in configs or []}
+        self.configs: dict[str, MCPServerConfig] = {}
+        for cfg in configs or []:
+            if cfg.name in self.configs:
+                raise ValueError(f'Duplicate MCP server name: {cfg.name!r}')
+            self.configs[cfg.name] = cfg
         self.clients: dict[str, MCPClient] = {}
         self.tools: dict[str, list[MCPTool]] = {}
         self.failed_servers: dict[str, Exception] = {}
