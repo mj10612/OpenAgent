@@ -109,6 +109,8 @@ class SessionStore:
     def _locked(self, session_id: str):
         self._get_session_path(session_id)
         lock_path = self._storage_dir / f"{session_id}.lock"
+        # Keep this path stable: unlinking it can let existing waiters and new
+        # writers lock different files and enter the critical section together.
         with lock_path.open("a+b") as handle:
             if handle.tell() == 0:
                 handle.write(b"0")
@@ -395,16 +397,20 @@ class SessionStore:
             self._cache.pop(session_id, None)
         return meta, messages
 
-    def list_sessions(self) -> list[SessionMetadata]:
+    def list_sessions(self, *, read_only: bool = False) -> list[SessionMetadata]:
         """List all stored sessions sorted by updated timestamp descending.
 
         Returns:
             List of SessionMetadata records.
+
+        Read-only scans observe metadata without creating coordination files;
+        concurrent writers may change the snapshot during listing.
         """
         sessions: list[SessionMetadata] = []
         for file_path in self._storage_dir.glob("*.jsonl"):
             try:
-                metadata = self.load_metadata(file_path.stem)
+                metadata = (self._load_metadata(file_path.stem) if read_only
+                            else self.load_metadata(file_path.stem))
                 sessions.append(metadata)
             except Exception as exc:
                 logger.warning("Failed to read session header from %s: %s", file_path, exc)

@@ -166,17 +166,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Instruction or query to execute",
     )
     run_parser.add_argument('--prompt-file', help='Read a UTF-8 prompt file (maximum 2 MiB); use - as the positional prompt for stdin')
+    run_parser.add_argument('--no-session-save', action='store_true', help='Keep conversation history in memory without saving an archive')
     output = run_parser.add_mutually_exclusive_group()
     output.add_argument('--json', action='store_true', help='Print one versioned JSON result')
     output.add_argument('--jsonl', action='store_true', help='Print versioned JSON events and a terminal result')
     run_parser.add_argument('--image', action='append', default=[], help='Attach local PNG/JPEG/GIF/WebP, max 5 MiB each, four images')
 
     # chat subcommand
-    subparsers.add_parser(
+    chat_parser = subparsers.add_parser(
         "chat",
         parents=[common_parser],
         help="Start an interactive REPL chat session",
     )
+    chat_parser.add_argument('--no-session-save', action='store_true', help='Keep conversation history in memory without saving an archive')
 
     # models subcommand
     models_parser = subparsers.add_parser(
@@ -205,6 +207,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sessions_parser.add_argument('--format', choices=['json', 'jsonl', 'markdown'], default='jsonl')
     sessions_parser.add_argument('--redact', action='store_true')
     sessions_parser.add_argument('--new-id', action='store_true')
+    sessions_parser.add_argument('--json', action='store_true', help='List session metadata as versioned JSON')
 
     # config subcommand
     subparsers.add_parser(
@@ -273,9 +276,12 @@ def _cmd_sessions(console: Console, args: argparse.Namespace | None = None) -> i
     session_dir = os.environ.get("OPENAGENT_SESSION_DIR")
     action = getattr(args, "session_action", "list")
     dry_run = getattr(args, 'dry_run', False)
+    machine = getattr(args, 'json', False)
+    if machine and (action != 'list' or dry_run or getattr(args, 'clear', False) or getattr(args, 'session_target', None)):
+        raise ValueError('sessions --json supports listing only')
     if dry_run and not (action == 'prune' or (action == 'list' and getattr(args, 'clear', False))):
         raise ValueError('--dry-run requires sessions prune or sessions --clear')
-    store = SessionStore(storage_dir=session_dir, create_directory=not dry_run)
+    store = SessionStore(storage_dir=session_dir, create_directory=not (dry_run or machine))
     if action in ('export', 'import', 'convert'):
         assert args is not None
         target = getattr(args, 'session_target', None)
@@ -336,7 +342,14 @@ def _cmd_sessions(console: Console, args: argparse.Namespace | None = None) -> i
             count = store.cleanup_sessions(older_than_days=None if clear else older_than)
             console.print(f"Deleted {count} session(s).", markup=False)
         return 0
-    sessions = store.list_sessions()
+    sessions = store.list_sessions(read_only=True) if machine else store.list_sessions()
+    if machine:
+        fields = ('session_id', 'model', 'title', 'created_at', 'updated_at', 'message_count')
+        _emit_json({'schema_version': 1, 'sessions': [
+            {key: getattr(session, key) for key in fields}
+            for session in sorted(sessions, key=lambda session: (-session.updated_at, session.session_id))
+        ]})
+        return 0
 
     if not sessions:
         console.print("[dim]No saved sessions found.[/dim]")
@@ -427,6 +440,7 @@ def _cmd_config(console: Console, args: argparse.Namespace) -> int:
 def _build_runner(
     cfg: OpenAgentConfig,
     console: Console,
+    *, save_sessions: bool = True,
 ) -> tuple[AgentRunner, MCPManager | None]:
     """Construct an initialized AgentRunner from configuration."""
     router = ProviderRouter()
@@ -459,7 +473,7 @@ def _build_runner(
         mcp_manager = MCPManager(registry=registry, configs=cfg.mcp_servers)
 
     session_dir = os.environ.get("OPENAGENT_SESSION_DIR")
-    session_store = SessionStore(storage_dir=session_dir)
+    session_store = SessionStore(storage_dir=session_dir) if save_sessions else None
 
     runner = AgentRunner(
         provider=provider,
@@ -478,6 +492,14 @@ def _build_runner(
 
 
 MAX_PROMPT_BYTES = 2 * 1024 * 1024
+
+
+def _resolve_repl_provider(model_ref: str, cfg: OpenAgentConfig):
+    """Apply configured custom mappings without leaking credentials to other providers."""
+    if model_ref.startswith(('custom/', 'custom:')):
+        kwargs = cfg.custom_provider.provider_kwargs() if cfg.custom_provider else {}
+        return ProviderRouter().resolve(model_ref, api_key=cfg.api_key, base_url=cfg.base_url, **kwargs)
+    return ProviderRouter().resolve(model_ref)
 
 
 def _read_run_prompt(args: argparse.Namespace) -> str:
@@ -510,8 +532,11 @@ async def _async_run(args: argparse.Namespace, console: Console) -> int:
     """Execute run or chat subcommands asynchronously."""
     prompt: str | Message = _read_run_prompt(args) if args.subcommand == 'run' else ''
     cfg = _load_args_config(args)
-
-    runner, mcp_manager = _build_runner(cfg, console)
+    no_save = getattr(args, 'no_session_save', False)
+    if no_save and cfg.session_id:
+        raise ValueError('--no-session-save cannot be combined with --resume')
+    runner, mcp_manager = (_build_runner(cfg, console, save_sessions=False) if no_save
+                           else _build_runner(cfg, console))
 
     try:
         if mcp_manager is not None:
@@ -601,7 +626,8 @@ async def _async_run(args: argparse.Namespace, console: Console) -> int:
             return code
         else:
             # Interactive chat REPL
-            await run_repl(runner, console=console, auto_approve=cfg.auto_approve)
+            await run_repl(runner, console=console, auto_approve=cfg.auto_approve,
+                           provider_factory=lambda model_ref: _resolve_repl_provider(model_ref, cfg))
             return 0
     finally:
         try:
@@ -708,6 +734,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     has_subcommand = False
     first_positional_idx: int | None = None
+    run_option_idx: int | None = None
+    run_values = {'--image', '--prompt-file'}
+    run_flags = {'--json', '--jsonl', '--no-session-save'}
     i = 0
     while i < len(args_list):
         arg = args_list[i]
@@ -724,7 +753,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         if any(arg.startswith(f"{opt}=") for opt in val_options):
             i += 1
             continue
-        if arg.startswith("-"):
+        if arg in run_values or any(arg.startswith(f'{opt}=') for opt in run_values):
+            if run_option_idx is None:
+                run_option_idx = i
+            i += 2 if arg in run_values else 1
+            continue
+        if arg in run_flags:
+            if run_option_idx is None:
+                run_option_idx = i
+            i += 1
+            continue
+        if arg.startswith("-") and arg != '-':
             i += 1
             continue
         if arg in known_subcommands:
@@ -735,8 +774,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             break
         i += 1
 
-    if not has_subcommand and first_positional_idx is not None:
-        args_list.insert(first_positional_idx, "run")
+    if not has_subcommand and (first_positional_idx is not None or run_option_idx is not None):
+        insertion = run_option_idx if run_option_idx is not None else first_positional_idx
+        assert insertion is not None
+        args_list.insert(insertion, "run")
 
     parser = _build_parser()
     try:
