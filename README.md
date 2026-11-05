@@ -45,7 +45,7 @@ Most AI coding agents tightly couple their orchestration logic to specific vendo
 4. **Atomic Tool-Response Integrity**:
    - Context window trimming and LLM-powered compaction strictly enforce the **Atomic Tool Pair Invariant**, guaranteeing assistant tool calls and their corresponding execution outputs are never severed.
 5. **Model Context Protocol (MCP)**:
-   - Full MCP 1.0 client support for `stdio` and `sse` transports with automatic registry namespacing and fault-tolerant rollback.
+   - Full MCP 1.0 client support for `stdio`, `sse`, and `streamable_http` transports with automatic registry namespacing and fault-tolerant rollback.
 6. **Rich Interactive Terminal Interface**:
    - Markdown streaming, styled reasoning/thinking blocks, syntax-highlighted tool execution, interactive permission prompts, and an interactive REPL chat mode.
 
@@ -72,7 +72,7 @@ flowchart TD
         FSTools["Sandboxed FS Tools\n(read_file • write_file • edit_file • ls • glob • grep)"]
         ShellTool["Safe Shell Tool\n(Bounded 100KB output • Process tree kill)"]
         AgentTools["Agent Tools\n(think • todo • web_fetch)"]
-        MCPMgr["MCPManager\n(stdio & SSE client connections • Tool namespacing)"]
+        MCPMgr["MCPManager\n(stdio, SSE & Streamable HTTP connections • Tool namespacing)"]
     end
 
     subgraph RouterLayer ["Model Routing & Transports"]
@@ -122,7 +122,7 @@ flowchart TD
 | **Sandboxed Filesystem** | `read_file`, `write_file`, `edit_file` (with uniqueness checks), `list_directory`, `glob_find`, and `grep_search`. Enforces strict workspace boundary confinement to prevent path traversal and symlink leaks. |
 | **Safe Shell Runner** | Cross-platform command execution, bounded memory output (capped at 100KB to protect context window), configurable timeouts, and process-tree termination (`taskkill /T /F` on Windows). |
 | **Agent Utilities** | `think` (structured scratchpad reasoning), `todo` (task list management), `web_fetch` (clean HTTP content extraction). |
-| **Model Context Protocol** | Seamless integration with external MCP servers over `stdio` and `sse` transports with automated tool discovery, namespacing, and graceful shutdown. |
+| **Model Context Protocol** | Seamless integration with external MCP servers over `stdio`, `sse`, and `streamable_http` transports with automated tool discovery, namespacing, and graceful shutdown. |
 | **Context Management** | Multilingual (CJK + ASCII) token estimation, automatic heuristic and LLM-driven compaction, sliding window message management, and atomic tool-response pairing. |
 | **Session Persistence** | High-performance JSONL session logs with atomic file swaps (`fsync` + `os.replace`), allowing full session restoration with `--resume <session-id>`. |
 | **Rich Terminal TUI** | Real-time streaming markdown, styled thinking panels, tool call syntax highlighting, non-blocking approval prompts, and interactive REPL chat mode with history. |
@@ -316,7 +316,7 @@ jsonpath_output_tokens = "response.metrics.completion_tokens"
 
 ## 🔌 Model Context Protocol (MCP)
 
-OpenAgent includes built-in support for the [Model Context Protocol](https://modelcontextprotocol.io). Connect any `stdio` or `sse` MCP server directly into the agent's tool registry.
+OpenAgent includes built-in support for the [Model Context Protocol](https://modelcontextprotocol.io). Connect any `stdio`, `sse`, or `streamable_http` MCP server directly into the agent's tool registry.
 
 Add MCP servers to your `./openagent.toml` or `~/.config/openagent/config.toml`:
 
@@ -341,6 +341,15 @@ env = { GITHUB_PERSONAL_ACCESS_TOKEN = "ghp_..." }
 name = "remote_analytics"
 transport = "sse"
 url = "https://analytics-mcp.internal.company.com/sse"
+
+# Remote Streamable HTTP MCP Server
+[[mcp_servers]]
+name = "remote_tools"
+transport = "streamable_http"
+url = "https://mcp.example.com/mcp"
+headers = { Authorization = "Bearer replace-with-token" }
+timeout = 30
+read_timeout = 120
 ```
 
 Tools provided by MCP servers are automatically prefixed with the server name (e.g. `sqlite__read_query`, `github__create_pull_request`) and are subject to the same danger policies as native tools.
@@ -544,6 +553,12 @@ Ollama.
 
 ```bash
 openagent run "inspect the project" --json
+# Shorthand accepts run options too
+openagent --json "inspect the project"
+openagent run "inspect without saving a conversation" --no-session-save
+openagent chat --no-session-save
+openagent sessions --json
+openagent sessions list --json
 openagent run "inspect the project" --jsonl
 openagent doctor --json
 openagent doctor --network --model ollama/llava
@@ -556,6 +571,15 @@ openagent sessions import backup.jsonl --new-id
 openagent sessions convert legacy.jsonl --output converted.jsonl
 openagent run "update the file" --tool-policy write_file=allow --tool-policy delete_file=deny
 ```
+
+`--no-session-save` disables conversation persistence for run and chat without
+creating session storage. It cannot be combined with `--resume`. This flag does
+not disable workspace mutations or filesystem checkpoints.
+
+Session listing with `--json` returns a stable object with `schema_version: 1`
+and a `sessions` array containing safe metadata: full IDs, timestamps, model,
+title, and message count. It omits message bodies and structured session state.
+Listing is read-only; a missing session archive returns an empty array.
 
 Read multiline UTF-8 prompts from a file or standard input:
 
@@ -616,8 +640,13 @@ conversation remain unchanged. New edits create checkpoints normally.
 `/changes` shows their diffs and `/undo` restores the latest
 turn only if files still match its recorded result. Content, mode and line endings
 are preserved; external shell/network/MCP side effects cannot be undone. Recovery
-does not run git reset. Checkpoints are memory-only, limited to twenty turns and
-40 MiB of retained pre-change data (2 MiB per file). They disappear on process exit.
+does not run git reset. Checkpoints retain up to twenty turns and
+40 MiB of retained in-memory data, counting both before and after snapshots
+(up to 2 MiB per file snapshot). Larger file moves and deletions use disk-backed
+`TemporaryFile` snapshots with a separate 1 GiB retained-storage cap. Completed
+oldest turns may be evicted to make room for disk snapshots; mutations that
+cannot fit are refused before execution. Checkpoints last only for the current
+process and are not restored by `--resume`.
 Set `checkpoint_enabled = false` in TOML to disable this facility.
 
 Export/import supports JSON and JSONL, with Markdown export for human reading.
@@ -627,6 +656,9 @@ before publishing and refuses existing session IDs unless `--new-id` is used.
 Concurrent stale session saves raise a conflict instead of replacing another
 writer's conversation. Reload or import/export into a new session to branch.
 Persistent `.lock` files coordinate processes and contain no conversation data.
+Session delete, prune, and clear remove archives but retain these stable
+coordination files: deleting or replacing a lock path could let waiting and new
+writers lock different files and bypass mutual exclusion.
 Resume uses the effective configuration/CLI model; saved metadata records the
 model most recently used to save the session.
 

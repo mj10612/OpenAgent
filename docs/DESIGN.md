@@ -1,7 +1,7 @@
 # OpenAgent implementation design
 
-This document describes the implemented architecture. Azure and Bedrock adapters,
-Streamable HTTP MCP, and a web search tool are not implemented. Their identifiers
+This document describes the implemented architecture. Azure and Bedrock adapters
+and a web search tool are not implemented. Their identifiers
 must not be interpreted as working native integrations.
 
 ## Execution flow
@@ -49,7 +49,7 @@ Paths below are relative to `src/openagent/`.
 | `tools/patch.py` | Atomic multi-hunk unified-diff editing |
 | `tools/shell.py` | Bounded subprocess output and process-tree termination |
 | `tools/agent_tools.py` | ThinkTool, TodoTool and WebFetchTool |
-| `tools/mcp/client.py` | MCP stdio/SSE connections and tool adapters |
+| `tools/mcp/client.py` | MCP stdio/SSE/Streamable HTTP connections and tool adapters |
 | `tools/mcp/manager.py` | Namespaced tools, lifecycle and reconnect preparation |
 | `session/store.py` | JSONL session transactions and recovery |
 | `tui/app.py` | Rich output, approval prompts and REPL |
@@ -136,15 +136,51 @@ name = "local"
 transport = "stdio"
 command = "example-mcp-server"
 args = []
+
+[[mcp_servers]]
+name = "remote"
+transport = "streamable_http"
+url = "https://mcp.example.com/mcp"
+headers = { Authorization = "Bearer replace-with-token" }
+timeout = 30
+read_timeout = 120
 ```
 
-Supported MCP transports are `stdio` and `sse`. A remote server uses
-`transport = "sse"` and `url = "https://example.com/sse"`. Arbitrary
+Supported MCP transports are `stdio`, `sse`, and `streamable_http`. Both remote
+transports accept `url`, `headers`, `timeout`, and `read_timeout`; SSE uses
+`transport = "sse"` with an SSE endpoint such as `https://example.com/sse`.
+Timeout values are positive seconds. Arbitrary
 `[providers.mygateway]` tables are not supported; use top-level endpoint settings
 and `[custom_provider]` instead. Paths resolve relative to the containing TOML.
 Credentials should normally come from environment variables.
 
+## Filesystem checkpoints
+
+`tools/changes.py` keeps up to twenty turns of process-local filesystem undo
+history, including failed and cancelled turns. The 40 MiB memory cap counts both
+before and after snapshots, with up to 2 MiB per in-memory file snapshot. Larger
+moves and deletions retain streaming `TemporaryFile` backups under a separate
+1 GiB disk cap. Completed oldest turns may be evicted to make disk space;
+mutations that cannot fit are refused before execution. Checkpoints disappear
+on process exit and are not restored by session resume.
+
+`/changes` inspects tracked changes and `/undo` restores the latest turn only
+when files still match its recorded result. `/checkpoints clear` asks for
+confirmation, discards undo history, and closes disk backups without changing
+current files or conversation history. Subsequent edits create new checkpoints.
+`checkpoint_enabled = false` disables tracking. Shell, network, and MCP side
+effects cannot be undone.
+
 ## Sessions and interactive inspection
+
+`run` and `chat` accept `--no-session-save` to skip session persistence and
+session-store creation. Combining it with `--resume` is rejected. Workspace
+mutations and process-local filesystem checkpoints remain available.
+
+`sessions --json` and `sessions list --json` return `schema_version: 1` and a
+`sessions` array with full IDs, timestamps, model, title, and message count.
+This read-only listing excludes message bodies and structured session state;
+a missing archive produces an empty array without creating storage.
 
 The initial session record and history replacements are written by atomic file
 replacement. Incremental saves append one JSONL batch containing new messages

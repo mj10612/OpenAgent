@@ -13,6 +13,7 @@ import asyncio
 import inspect
 import json
 import signal
+from collections.abc import Callable
 from pathlib import Path
 from types import FrameType
 from typing import Any
@@ -40,6 +41,7 @@ from openagent.core.events import (
     ToolResultEvent,
     UsageEvent,
 )
+from openagent.core.provider import ChatProvider
 from openagent.core.router import ProviderRouter
 from openagent.core.types import Message, ToolCall, Usage
 from openagent.tools.registry import AskCallback
@@ -228,6 +230,7 @@ async def run_repl(
     runner: Any,
     console: Console | None = None,
     auto_approve: bool = False,
+    provider_factory: Callable[[str], ChatProvider] | None = None,
 ) -> None:
     """Interactive REPL chat loop."""
     active_console = console if console is not None else Console()
@@ -255,6 +258,8 @@ async def run_repl(
     pending_images: list[str] = []
     original_ask = ask_cb
     async def preview_ask(call: ToolCall) -> bool:
+        if auto_approve:
+            return True
         changes = getattr(runner.tools, 'changes', None)
         tool = runner.tools.get(call.name)
         if changes is not None and tool is not None:
@@ -367,7 +372,7 @@ async def run_repl(
                 active_console.print(f"Model: {runner.model}", markup=False)
                 continue
             try:
-                new_provider = ProviderRouter().resolve(model_ref)
+                new_provider = (provider_factory or ProviderRouter().resolve)(model_ref)
             except Exception as exc:
                 active_console.print(f"Could not switch model: {exc}", markup=False)
                 continue
