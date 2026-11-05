@@ -138,6 +138,11 @@ class GeminiProvider(ChatProvider):
                     case ThinkingPart(text=t) if t:
                         parts.append({"text": t, "thought": True})
                     case ImagePart(data=d, mime_type=m):
+                        if not d or not m:
+                            raise ProviderError(
+                                'Gemini image input requires inline base64 data and a MIME type; URL-only images are unsupported',
+                                provider=self.name,
+                            )
                         if d and m:
                             parts.append(
                                 {
