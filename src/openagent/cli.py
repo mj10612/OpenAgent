@@ -197,9 +197,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="List past conversation sessions and resumption commands",
     )
     sessions_parser.add_argument(
-        "session_action", nargs="?", choices=["list", "delete", "rm", "prune", "export", "import", "convert"], default="list"
+        "session_action", nargs="?", choices=["list", "delete", "rm", "prune", "export", "import", "convert", "rename"], default="list"
     )
     sessions_parser.add_argument("session_target", nargs="?")
+    sessions_parser.add_argument('session_title', nargs='?', help='New title for sessions rename; quote multiword titles')
     sessions_parser.add_argument("--older-than", type=float, dest="older_than_days")
     sessions_parser.add_argument("--clear", action="store_true")
     sessions_parser.add_argument('--dry-run', action='store_true', help='Preview prune/clear targets without deleting sessions')
@@ -282,6 +283,15 @@ def _cmd_sessions(console: Console, args: argparse.Namespace | None = None) -> i
     if dry_run and not (action == 'prune' or (action == 'list' and getattr(args, 'clear', False))):
         raise ValueError('--dry-run requires sessions prune or sessions --clear')
     store = SessionStore(storage_dir=session_dir, create_directory=not (dry_run or machine))
+    if getattr(args, 'session_title', None) is not None and action != 'rename':
+        raise ValueError('A title is only accepted with sessions rename')
+    if action == 'rename':
+        target, title = getattr(args, 'session_target', None), getattr(args, 'session_title', None)
+        if not target or title is None:
+            raise ValueError('Use sessions rename <id-or-prefix> <title>')
+        store.rename_session(target, title)
+        console.print(f'Session renamed: {title}', markup=False)
+        return 0
     if action in ('export', 'import', 'convert'):
         assert args is not None
         target = getattr(args, 'session_target', None)
