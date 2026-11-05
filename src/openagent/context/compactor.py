@@ -17,7 +17,7 @@ from html import escape
 from openagent.context.estimator import TokenEstimator
 from openagent.context.messages import MessageManager
 from openagent.core.provider import ChatProvider
-from openagent.core.types import ChatRequest, Message, Role, TextPart, Usage
+from openagent.core.types import ChatRequest, FinishReason, Message, Role, TextPart, Usage
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +184,8 @@ class Compactor:
             return self.extract_heuristic_summary(messages)
         response = await provider.complete(request)
         self.usage = self.usage + response.usage
+        if response.finish_reason != FinishReason.STOP:
+            raise ValueError(f'Provider returned incomplete summary: {response.finish_reason}')
         summary_text = response.message.text.strip()
         if not summary_text:
             raise ValueError("Provider returned empty summary")
