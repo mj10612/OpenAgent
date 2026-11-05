@@ -203,16 +203,42 @@ class AnthropicProvider(ChatProvider):
             elif request.tool_choice == "none":
                 payload.pop("tools")
 
+        thinking = None
         if request.thinking.enabled:
-            payload["thinking"] = {
+            thinking = {
                 "type": "enabled",
-                "budget_tokens": request.thinking.budget_tokens or 4096,
+                "budget_tokens": request.thinking.budget_tokens,
             }
+            payload["thinking"] = thinking
             # Extended thinking requires the default temperature.
             payload.pop("temperature", None)
             payload.pop("top_p", None)
 
         payload.update(self.extra_body)
+        effective_thinking = payload.get("thinking")
+        if isinstance(effective_thinking, Mapping) and effective_thinking.get("type") == "enabled":
+            maximum = payload["max_tokens"]
+            if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0:
+                raise ValueError("Anthropic thinking requires a positive integer max_tokens")
+            if effective_thinking is thinking and request.thinking.budget_tokens is None:
+                if maximum <= 1024:
+                    raise ValueError("Anthropic thinking requires max_tokens greater than 1024")
+                thinking["budget_tokens"] = min(4096, maximum - 1)
+            budget = effective_thinking.get("budget_tokens")
+            if isinstance(budget, bool) or not isinstance(budget, int) or budget < 1024:
+                raise ValueError("Anthropic thinking budget_tokens must be an integer >= 1024")
+            beta_features = {
+                feature.strip()
+                for key, value in self._transport.extra_headers.items()
+                if key.lower() == "anthropic-beta"
+                for feature in value.split(",")
+            }
+            # Interleaved tool thinking can spend its budget across multiple turns.
+            interleaved = bool(payload.get("tools")) and (
+                "interleaved-thinking-2025-05-14" in beta_features
+            )
+            if budget >= maximum and not interleaved:
+                raise ValueError("Anthropic thinking budget_tokens must be less than max_tokens")
         return payload
 
     # -- streaming ---------------------------------------------------------- #

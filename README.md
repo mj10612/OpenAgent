@@ -566,6 +566,7 @@ openagent models --discover --model ollama/llava --json
 openagent models --discover --refresh --model ollama/llava
 openagent run "explain this screenshot" --image "screenshots/UI error.png"
 openagent sessions export <id> --output backup.jsonl
+openagent sessions rename <id-or-prefix> "Review authentication"
 openagent sessions export <id> --format markdown --redact --output conversation.md
 openagent sessions import backup.jsonl --new-id
 openagent sessions convert legacy.jsonl --output converted.jsonl
@@ -579,6 +580,9 @@ not disable workspace mutations or filesystem checkpoints.
 Session listing with `--json` returns a stable object with `schema_version: 1`
 and a `sessions` array containing safe metadata: full IDs, timestamps, model,
 title, and message count. It omits message bodies and structured session state.
+`sessions rename <id-or-prefix> "New title"` changes only the title using the
+session lock and atomic publication. It preserves conversation timestamps,
+messages and saved checklist state, so age-based retention remains unchanged.
 Listing is read-only; a missing session archive returns an empty array.
 
 Read multiline UTF-8 prompts from a file or standard input:

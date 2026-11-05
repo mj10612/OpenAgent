@@ -579,6 +579,21 @@ class SessionStore:
             self._atomic_write_session(session_id, metadata, messages)
         return session_id
 
+    def rename_session(self, session_id: str, title: str) -> None:
+        """Atomically rename a session without changing its retention timestamp."""
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError('Session title must be nonempty')
+        session_id = self.resolve_session_id(session_id)
+        with self._locked(session_id):
+            revision = self._revision(session_id)
+            if session_id in self._revisions and self._revisions[session_id] != revision:
+                raise SessionConflictError(f"Session conflict for '{session_id}': reload before renaming")
+            metadata, messages = self._load_session(session_id)
+            metadata.title = title
+            # Bypass save_messages' conversation timestamp refresh, while using
+            # the same locked atomic publication and revision bookkeeping.
+            self._atomic_write_session(session_id, metadata, messages)
+
     def delete_session(self, session_id: str) -> bool:
         """Delete session data and any associated temporary files.
 
