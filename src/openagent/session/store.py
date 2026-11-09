@@ -37,6 +37,16 @@ _MAX_IMAGE_BYTES = 5 * 1024 * 1024
 _MAX_IMAGE_BASE64_LENGTH = ((_MAX_IMAGE_BYTES + 2) // 3) * 4
 
 
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Reject duplicate keys before JSON decoding can silently discard values."""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate JSON object key in session archive")
+        result[key] = value
+    return result
+
+
 def normalize_session_directory(storage_dir: str | Path | None = None) -> Path:
     """Resolve a session destination without creating directories."""
     if storage_dir is None or (isinstance(storage_dir, str) and not storage_dir.strip()):
@@ -357,7 +367,8 @@ class SessionStore:
         corrupt = False
         for lineno, line in enumerate(lines, start=1):
             try:
-                raw_obj = json.loads(line)
+                raw_obj = (json.loads(line, object_pairs_hook=_unique_json_object)
+                           if strict else json.loads(line))
                 if not isinstance(raw_obj, Mapping):
                     raise ValueError("session row must be an object")
                 if raw_obj.get("type") == "batch":

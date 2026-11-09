@@ -165,3 +165,41 @@ def test_rename_preserves_invalid_checklist_metadata(tmp_path, metadata_source):
     # Loading still recovers the usable history without writing a repaired archive.
     assert SessionStore(tmp_path).load_session(sid)[1][0].text == 'kept conversation'
     assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize('incremental', [False, True])
+@pytest.mark.parametrize('preloaded', [False, True])
+@pytest.mark.parametrize('duplicate_source', ['snapshot', 'batch', 'message', 'content-part'])
+def test_rename_refuses_duplicate_json_keys_without_discarding_values(
+    tmp_path, incremental, preloaded, duplicate_source,
+):
+    store = SessionStore(tmp_path, incremental=incremental)
+    sid = saved(store)
+    path = tmp_path / (sid + '.jsonl')
+    if duplicate_source == 'snapshot':
+        path.write_bytes(path.read_bytes().replace(
+            b'"title": "before"', b'"title":"RECOVERY_TARGET","title":"before"', 1,
+        ))
+    else:
+        rows = {
+            'batch': b'{"type":"batch","metadata":{"title":"RECOVERY_TARGET","title":"before"},"messages":[]}\n',
+            'message': br'{"role":"user","content":"RECOVERY_TARGET","con\u0074ent":"last value"}' + b'\n',
+            'content-part': b'{"role":"user","content":[{"type":"text","text":"RECOVERY_TARGET","text":"last value"}]}\n',
+        }
+        with path.open('ab') as output:
+            output.write(rows[duplicate_source])
+    before = path.read_bytes()
+    before_mtime = path.stat().st_mtime_ns
+    assert b'RECOVERY_TARGET' in before
+    fresh = SessionStore(tmp_path)
+    if preloaded:
+        # Recovery reads may still use the last value, but must preserve the archive.
+        assert fresh.load_session(sid)[1][0].text == 'kept conversation'
+        assert path.read_bytes() == before
+
+    with pytest.raises(ValueError, match='damaged'):
+        fresh.rename_session(sid, 'new')
+
+    assert path.read_bytes() == before
+    assert path.stat().st_mtime_ns == before_mtime
+    assert not list(tmp_path.glob('*.tmp'))
