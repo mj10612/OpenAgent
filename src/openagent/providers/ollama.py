@@ -126,7 +126,15 @@ class OllamaProvider(ChatProvider):
                     "content": msg.text,
                 }
             case _:
-                images = [p.data for p in msg.content if isinstance(p, ImagePart) and p.data]
+                images: list[str] = []
+                for part in msg.content:
+                    if isinstance(part, ImagePart):
+                        if not part.data:
+                            raise ProviderError(
+                                "Ollama image input requires inline base64 data; URL-only images are unsupported",
+                                provider=self.name,
+                            )
+                        images.append(part.data)
                 text_parts = [p.text for p in msg.content if isinstance(p, TextPart) and p.text]
                 out = {
                     "role": "user",
