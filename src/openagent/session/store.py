@@ -37,6 +37,16 @@ _MAX_IMAGE_BYTES = 5 * 1024 * 1024
 _MAX_IMAGE_BASE64_LENGTH = ((_MAX_IMAGE_BYTES + 2) // 3) * 4
 
 
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Reject duplicate keys before JSON decoding can silently discard values."""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate JSON object key in session archive")
+        result[key] = value
+    return result
+
+
 def normalize_session_directory(storage_dir: str | Path | None = None) -> Path:
     """Resolve a session destination without creating directories."""
     if storage_dir is None or (isinstance(storage_dir, str) and not storage_dir.strip()):
@@ -73,7 +83,7 @@ class SessionMetadata:
         }
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> SessionMetadata:
+    def from_dict(cls, data: Mapping[str, Any], *, strict: bool = False) -> SessionMetadata:
         """Construct SessionMetadata from a dictionary."""
         created_at = float(data.get("created_at", time.time()))
         updated_at = float(data.get("updated_at", time.time()))
@@ -81,6 +91,8 @@ class SessionMetadata:
             raise ValueError("Session timestamps must be finite")
         todo_state = data.get('todo_state')
         if todo_state is not None and not isinstance(todo_state, Mapping):
+            if strict:
+                raise ValueError('Invalid checklist state in session metadata')
             logger.warning('Skipped invalid checklist state in session metadata')
             todo_state = None
         return cls(
@@ -318,13 +330,14 @@ class SessionStore:
         with self._locked(session_id):
             return self._load_session(session_id)
 
-    def _load_session(self, session_id: str) -> tuple[SessionMetadata, list[Message]]:
+    def _load_session(self, session_id: str, *, strict: bool = False) -> tuple[SessionMetadata, list[Message]]:
+        """Read history, optionally refusing to discard damaged archive content."""
         session_path = self._get_session_path(session_id)
         if not session_path.is_file():
             raise FileNotFoundError(f"Session '{session_id}' not found at {session_path}")
 
         lines: list[str] = []
-        with open(session_path, encoding="utf-8", errors="replace") as f:
+        with open(session_path, encoding="utf-8", errors="strict" if strict else "replace") as f:
             for line in f:
                 stripped = line.strip()
                 if stripped:
@@ -354,19 +367,20 @@ class SessionStore:
         corrupt = False
         for lineno, line in enumerate(lines, start=1):
             try:
-                raw_obj = json.loads(line)
+                raw_obj = (json.loads(line, object_pairs_hook=_unique_json_object)
+                           if strict else json.loads(line))
                 if not isinstance(raw_obj, Mapping):
                     raise ValueError("session row must be an object")
                 if raw_obj.get("type") == "batch":
                     batch_messages = [self._deserialize_message(row) for row in raw_obj["messages"]]
-                    batch_meta = SessionMetadata.from_dict(raw_obj["metadata"])
+                    batch_meta = SessionMetadata.from_dict(raw_obj["metadata"], strict=strict)
                     batch_meta.session_id = session_id
                     messages.extend(batch_messages)
                     meta = batch_meta
                 elif raw_obj.get("type") == "metadata" or "session_id" in raw_obj:
                     if lineno != 1:
                         raise ValueError("unexpected metadata row")
-                    meta = SessionMetadata.from_dict(raw_obj)
+                    meta = SessionMetadata.from_dict(raw_obj, strict=strict)
                     meta.session_id = session_id
                 else:
                     message = self._deserialize_message(raw_obj)
@@ -395,6 +409,8 @@ class SessionStore:
             self._remember(session_id, meta, messages)
         else:
             self._cache.pop(session_id, None)
+            if strict:
+                raise ValueError(f"Session '{session_id}' is damaged; refusing to discard unrecovered data")
         return meta, messages
 
     def list_sessions(self, *, read_only: bool = False) -> list[SessionMetadata]:
@@ -580,7 +596,7 @@ class SessionStore:
         return session_id
 
     def rename_session(self, session_id: str, title: str) -> None:
-        """Atomically rename a session without changing its retention timestamp."""
+        """Atomically rename an intact session without changing its retention timestamp."""
         if not isinstance(title, str) or not title.strip():
             raise ValueError('Session title must be nonempty')
         session_id = self.resolve_session_id(session_id)
@@ -588,7 +604,7 @@ class SessionStore:
             revision = self._revision(session_id)
             if session_id in self._revisions and self._revisions[session_id] != revision:
                 raise SessionConflictError(f"Session conflict for '{session_id}': reload before renaming")
-            metadata, messages = self._load_session(session_id)
+            metadata, messages = self._load_session(session_id, strict=True)
             metadata.title = title
             # Bypass save_messages' conversation timestamp refresh, while using
             # the same locked atomic publication and revision bookkeeping.
