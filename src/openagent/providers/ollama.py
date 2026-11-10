@@ -164,6 +164,9 @@ class OllamaProvider(ChatProvider):
             payload["tools"] = [spec.to_openai_schema() for spec in request.tools]
 
         payload.update(self.extra_body)
+        if request.response_format == "json_object":
+            # Explicit JSON mode takes precedence over provider-level format defaults.
+            payload["format"] = "json"
         payload["options"] = {
             **self.extra_body.get("options", {}),
             **options,
