@@ -72,7 +72,7 @@ class TodoTool(Tool):
             ToolParam(
                 name="task",
                 type="string",
-                description="Task text or number to mark complete",
+                description="Task text to search for, or a 1-based task number to mark complete",
                 required=False,
             ),
         ]
@@ -155,7 +155,7 @@ class TodoTool(Tool):
                     self._tasks[idx]["done"] = True
                     found = True
 
-            if not found:
+            else:
                 target_lower = target_str.lower()
                 for item in self._tasks:
                     if target_lower in item["text"].lower():
