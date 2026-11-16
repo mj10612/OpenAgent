@@ -148,13 +148,12 @@ class TodoTool(Tool):
                 )
 
             found = False
-            # Check numeric index (1-based)
-            if target_str.isdigit():
+            # Signed decimal IDs must not fall back to matching task titles.
+            if re.fullmatch(r"[+-]?\d+", target_str):
                 idx = int(target_str) - 1
                 if 0 <= idx < len(self._tasks):
                     self._tasks[idx]["done"] = True
                     found = True
-
             else:
                 target_lower = target_str.lower()
                 for item in self._tasks:
