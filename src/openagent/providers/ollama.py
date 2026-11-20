@@ -156,6 +156,8 @@ class OllamaProvider(ChatProvider):
             options["temperature"] = request.temperature
         if request.top_p is not None:
             options["top_p"] = request.top_p
+        if request.seed is not None:
+            options["seed"] = request.seed
         if request.stop:
             options["stop"] = list(request.stop)
         if request.max_tokens is not None or self.default_max_tokens is not None:
