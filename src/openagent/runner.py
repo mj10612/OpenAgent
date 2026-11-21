@@ -166,7 +166,7 @@ class AgentRunner:
         user_input: str | Message,
         ask_callback: AskCallback | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        """Execute a transaction, restoring history on errors or interrupted consumption."""
+        """Restore history and the built-in checklist on errors or interruption."""
         if self._turn_active:
             yield ErrorEvent(RuntimeError("A runner turn is already active"))
             return
@@ -176,6 +176,8 @@ class AgentRunner:
             self._ensure_system_prompt()
             initial_messages = self.messages.copy().messages
             initial_session_id = self.session_id
+            todo = self.tools.get('todo')
+            initial_todo_state = todo.snapshot_state() if isinstance(todo, TodoTool) else None
             completed = False
             stream = self._run_turn(user_input, ask_callback)
             try:
@@ -183,12 +185,16 @@ class AgentRunner:
                     if isinstance(event, ErrorEvent):
                         self.messages.clear()
                         self.messages.extend(initial_messages)
+                        if isinstance(todo, TodoTool):
+                            todo.restore_state(initial_todo_state)
                     if isinstance(event, DoneEvent):
                         completed = True
                     yield event
             except Exception as exc:
                 self.messages.clear()
                 self.messages.extend(initial_messages)
+                if isinstance(todo, TodoTool):
+                    todo.restore_state(initial_todo_state)
                 yield ErrorEvent(error=exc)
             finally:
                 await stream.aclose()
@@ -196,6 +202,8 @@ class AgentRunner:
                     self.messages.clear()
                     self.messages.extend(initial_messages)
                     self.session_id = initial_session_id
+                    if isinstance(todo, TodoTool):
+                        todo.restore_state(initial_todo_state)
         finally:
             self._turn_active = False
 
