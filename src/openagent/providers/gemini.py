@@ -202,6 +202,11 @@ class GeminiProvider(ChatProvider):
                 payload.pop("tools", None)
 
         payload.update(self.extra_body)
+        if request.seed is not None:
+            payload["generationConfig"] = {
+                **payload.get("generationConfig", {}),
+                "seed": request.seed,
+            }
         return payload
 
     # -- streaming ---------------------------------------------------------- #
