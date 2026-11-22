@@ -11,7 +11,11 @@ from openagent.providers.gemini import GeminiProvider
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("seed", [0, 42])
-@pytest.mark.parametrize("extra_body", [{}, {"generationConfig": {"seed": 7, "topK": 20}}])
+@pytest.mark.parametrize("extra_body", [
+    {},
+    {"generationConfig": None},
+    {"generationConfig": {"seed": 7, "topK": 20}},
+])
 async def test_request_seed_reaches_gemini_http_payload(seed, extra_body):
     bodies = []
 
@@ -29,15 +33,15 @@ async def test_request_seed_reaches_gemini_http_payload(seed, extra_body):
         events = [event async for event in provider.stream(request)]
         assert isinstance(events[-1], DoneEvent)
         assert len(bodies) == 1
-        assert bodies[0]["generationConfig"]["seed"] == seed
-        if "generationConfig" in extra_body:
-            assert bodies[0]["generationConfig"]["topK"] == 20
+        assert bodies[0]["generationConfig"] == {
+            **(before.get("generationConfig") or {}), "seed": seed,
+        }
         assert provider.extra_body == before
         following = provider.build_payload(ChatRequest(
             model="fixture", messages=[Message.user("Next request")],
         ))
-        if "generationConfig" in extra_body:
-            assert following["generationConfig"] == {"seed": 7, "topK": 20}
+        if "generationConfig" in before:
+            assert following["generationConfig"] == before["generationConfig"]
         else:
             assert "seed" not in following.get("generationConfig", {})
 

@@ -203,8 +203,9 @@ class GeminiProvider(ChatProvider):
 
         payload.update(self.extra_body)
         if request.seed is not None:
+            effective_config = payload.get("generationConfig")
             payload["generationConfig"] = {
-                **payload.get("generationConfig", {}),
+                **(effective_config if effective_config is not None else {}),
                 "seed": request.seed,
             }
         return payload
