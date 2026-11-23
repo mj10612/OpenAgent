@@ -196,6 +196,26 @@ async def test_ollama_context_and_options_are_consistent(context_window):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("default_options", [{}, {"seed": 7, "top_k": 20}])
+async def test_ollama_stream_sends_request_seed(default_options):
+    expected = {**default_options, "num_ctx": 32768, "temperature": 0.5}
+    sent_options = []
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        assert http_request.url.path == "/api/chat"
+        sent_options.append(json.loads(http_request.content)["options"])
+        return httpx.Response(200, text='{"message":{"content":"ok"},"done":true}\n')
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = OllamaProvider("test", extra_body={"options": default_options}, client=client)
+        for seed in (0, 42, None):
+            result = [event async for event in provider.stream(request(seed=seed, temperature=0.5))]
+            assert isinstance(result[-1], DoneEvent)
+
+    assert sent_options == [{**expected, "seed": 0}, {**expected, "seed": 42}, expected]
+
+
+@pytest.mark.asyncio
 async def test_gemini_json_mode():
     provider = GeminiProvider("test")
     assert (
