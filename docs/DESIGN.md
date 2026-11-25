@@ -75,8 +75,9 @@ retained as ThinkingPart values. Session serialization preserves this informatio
 An assistant tool-call message and its matching tool-result messages form one
 atomic group. Call IDs must be nonempty and unique before tools execute. Results
 must correspond exactly afterward. Invalid or orphaned groups are never sent to
-providers. Failed or cancelled turns restore prior conversation history; external
-tool side effects cannot be undone by restoring messages.
+providers. Failed or cancelled turns restore prior conversation history and the
+built-in todo checklist. External tool side effects cannot be undone by restoring
+messages.
 
 ## Context management
 
