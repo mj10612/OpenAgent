@@ -72,7 +72,7 @@ class TodoTool(Tool):
             ToolParam(
                 name="task",
                 type="string",
-                description="Task text or number to mark complete",
+                description="Task text to search for, or a 1-based task number to mark complete",
                 required=False,
             ),
         ]
@@ -148,14 +148,17 @@ class TodoTool(Tool):
                 )
 
             found = False
-            # Check numeric index (1-based)
-            if target_str.isdigit():
-                idx = int(target_str) - 1
-                if 0 <= idx < len(self._tasks):
-                    self._tasks[idx]["done"] = True
+            digits = target_str[1:] if target_str.startswith(("+", "-")) else target_str
+            if digits.isdigit():
+                try:
+                    task_number = int(target_str)
+                except ValueError:
+                    # Some Unicode digits cannot be parsed as decimal integers.
+                    task_number = 0
+                if 1 <= task_number <= len(self._tasks):
+                    self._tasks[task_number - 1]["done"] = True
                     found = True
-
-            if not found:
+            else:
                 target_lower = target_str.lower()
                 for item in self._tasks:
                     if target_lower in item["text"].lower():
