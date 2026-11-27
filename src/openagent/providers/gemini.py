@@ -279,6 +279,11 @@ class GeminiProvider(ChatProvider):
                                 finish_reason = FinishReason.STOP
                             case "MAX_TOKENS":
                                 finish_reason = FinishReason.LENGTH
+                            case "MALFORMED_FUNCTION_CALL" | "MALFORMED_RESPONSE":
+                                raise ProviderError(
+                                    f"Generation failed with finish reason {cand_finish}",
+                                    provider=self.name,
+                                )
                             case (
                                 "SAFETY"
                                 | "RECITATION"
