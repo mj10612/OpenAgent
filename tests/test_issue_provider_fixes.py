@@ -11,6 +11,8 @@ from openagent.providers.custom import CustomJsonPathProvider
 from openagent.providers.gemini import GeminiProvider
 from openagent.providers.ollama import OllamaProvider
 from openagent.providers.openai_compat import OpenAICompatProvider
+from openagent.runner import AgentRunner
+from openagent.session.store import SessionStore
 
 
 def request(**kwargs):
@@ -118,6 +120,32 @@ async def test_gemini_usage_preserves_partial_snapshots():
         usage.reasoning_tokens,
         usage.cached_tokens,
     ) == (34, 24, 20, 7)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["MALFORMED_FUNCTION_CALL", "MALFORMED_RESPONSE", "STOP"])
+async def test_gemini_finish_reason_controls_turn_persistence(reason, tmp_path):
+    candidate = {"finishReason": reason}
+    if reason == "STOP":
+        candidate["content"] = {"role": "model", "parts": [{"text": "ok"}]}
+    body = f"data: {json.dumps({'candidates': [candidate]})}\n\n"
+
+    def handle(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        provider = GeminiProvider("test", client=client)
+        runner = AgentRunner(provider, session_store=SessionStore(tmp_path))
+
+        if reason == "STOP":
+            assert await runner.run_turn_to_completion("hi") == "ok"
+            assert len(list(tmp_path.glob("*.jsonl"))) == 1
+        else:
+            with pytest.raises(ProviderError, match=reason) as error:
+                await runner.run_turn_to_completion("hi")
+            assert error.value.provider == "gemini"
+            assert runner.session_id is None
+            assert not list(tmp_path.glob("*.jsonl"))
 
 
 @pytest.mark.asyncio
