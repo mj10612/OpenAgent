@@ -293,7 +293,10 @@ class GeminiProvider(ChatProvider):
                             ):
                                 finish_reason = FinishReason.CONTENT_FILTER
                             case _:
-                                finish_reason = FinishReason.STOP
+                                raise ProviderError(
+                                    f"Unsupported generation finish reason: {cand_finish}",
+                                    provider=self.name,
+                                )
 
                     content = candidate.get("content") or {}
                     parts = content.get("parts") or []

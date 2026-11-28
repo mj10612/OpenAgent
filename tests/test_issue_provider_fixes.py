@@ -123,7 +123,11 @@ async def test_gemini_usage_preserves_partial_snapshots():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reason", ["MALFORMED_FUNCTION_CALL", "MALFORMED_RESPONSE", "STOP"])
+@pytest.mark.parametrize("reason", [
+    "MALFORMED_FUNCTION_CALL", "MALFORMED_RESPONSE", "UNEXPECTED_TOOL_CALL",
+    "TOO_MANY_TOOL_CALLS", "MISSING_THOUGHT_SIGNATURE", "OTHER", "IMAGE_OTHER",
+    "NO_IMAGE", "CONTINUATION", "FINISH_REASON_UNSPECIFIED", "FUTURE_FINISH_REASON", "STOP",
+])
 async def test_gemini_finish_reason_controls_turn_persistence(reason, tmp_path):
     candidate = {"finishReason": reason}
     if reason == "STOP":
